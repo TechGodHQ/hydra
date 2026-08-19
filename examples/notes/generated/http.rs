@@ -6,8 +6,6 @@ use std::collections::BTreeMap;
 use axum::{extract::{Path, Query, State}, response::Response, routing::{get, post}, Json, Router};
 use serde_json::Value;
 
-use crate::AppState;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GeneratedRoute {
     pub name: &'static str,
@@ -30,7 +28,7 @@ pub const GENERATED_ROUTES: &[GeneratedRoute] = &[
     GeneratedRoute { name: "note_stats", method: "GET", path: "/stats" },
 ];
 
-pub fn generated_router() -> Router<AppState> {
+pub fn generated_router() -> Router<crate::AppState> {
     Router::new()
         .route("/notes", get(list_notes))
         .route("/notes/{note_id}", get(get_note))
@@ -40,7 +38,7 @@ pub fn generated_router() -> Router<AppState> {
 }
 
 async fn list_notes(
-    State(state): State<AppState>,
+    State(state): State<crate::AppState>,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Response {
     crate::execute_operation_http(
@@ -56,7 +54,7 @@ async fn list_notes(
 }
 
 async fn get_note(
-    State(state): State<AppState>,
+    State(state): State<crate::AppState>,
     Path(path): Path<BTreeMap<String, String>>,
 ) -> Response {
     crate::execute_operation_http(
@@ -72,7 +70,7 @@ async fn get_note(
 }
 
 async fn create_note(
-    State(state): State<AppState>,
+    State(state): State<crate::AppState>,
     Json(body): Json<Value>,
 ) -> Response {
     crate::execute_operation_http(
@@ -88,7 +86,7 @@ async fn create_note(
 }
 
 async fn delete_note(
-    State(state): State<AppState>,
+    State(state): State<crate::AppState>,
     Path(path): Path<BTreeMap<String, String>>,
 ) -> Response {
     crate::execute_operation_http(
@@ -104,7 +102,7 @@ async fn delete_note(
 }
 
 async fn note_stats(
-    State(state): State<AppState>,
+    State(state): State<crate::AppState>,
 ) -> Response {
     crate::execute_operation_http(
         &state,

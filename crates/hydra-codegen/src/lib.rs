@@ -205,7 +205,6 @@ fn generate_http(definition: &ApiDefinition, config: &GenerateConfig) -> String 
     out.push_str("use std::collections::BTreeMap;\n\n");
     out.push_str("use axum::{extract::{Path, Query, State}, response::Response, routing::{get, post}, Json, Router};\n");
     out.push_str("use serde_json::Value;\n\n");
-    push_fmt!(out, "use {};\n\n", config.http_state_type);
     out.push_str("#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n");
     out.push_str("pub struct GeneratedRoute {\n");
     out.push_str("    pub name: &'static str,\n");
@@ -231,8 +230,8 @@ fn generate_http(definition: &ApiDefinition, config: &GenerateConfig) -> String 
     out.push_str("];\n\n");
     push_fmt!(
         out,
-        "pub fn generated_router() -> Router<{}State> {{\n",
-        state_type_short(&config.http_state_type)
+        "pub fn generated_router() -> Router<{}> {{\n",
+        config.http_state_type
     );
     out.push_str("    Router::new()\n");
     for operation in http_operations(definition).filter(|o| !o.is_sse()) {
@@ -283,8 +282,8 @@ fn push_unary_handler(out: &mut String, operation: &Operation, config: &Generate
     out.push_str("(\n");
     push_fmt!(
         out,
-        "    State(state): State<{}State>,\n",
-        state_type_short(&config.http_state_type)
+        "    State(state): State<{}>,\n",
+        config.http_state_type
     );
     if has_path {
         out.push_str("    Path(path): Path<BTreeMap<String, String>>,\n");
@@ -333,7 +332,7 @@ fn generate_sse_surface(definition: &ApiDefinition, config: &GenerateConfig) -> 
     if sse_operations.is_empty() {
         return String::new();
     }
-    let state_short = state_type_short(&config.http_state_type);
+    let state_path = &config.http_state_type;
     let mut out = String::new();
     out.push_str("/// Streaming (SSE) operations declared in the API definition. The\n");
     out.push_str("/// generated surface exposes only this metadata plus the binding hooks\n");
@@ -362,7 +361,7 @@ fn generate_sse_surface(definition: &ApiDefinition, config: &GenerateConfig) -> 
         out.push_str("/// binding; generated code does not generate a duplicate route.\n");
         push_fmt!(
             out,
-            "pub fn bind_{}(router: Router<{state_short}>) -> Router<{state_short}> {{\n",
+            "pub fn bind_{}(router: Router<{state_path}>) -> Router<{state_path}> {{\n",
             operation.name
         );
         push_fmt!(
@@ -378,17 +377,6 @@ fn generate_sse_surface(definition: &ApiDefinition, config: &GenerateConfig) -> 
 
 fn http_operations(definition: &ApiDefinition) -> impl Iterator<Item = &Operation> {
     definition.operations.iter().filter(|o| o.generates_http())
-}
-
-/// `crate::app::AppState` → `App`, so generated code can say `Router<App>`
-/// while the config keeps the full path for the `use` line.
-fn state_type_short(state_type: &str) -> String {
-    state_type
-        .rsplit("::")
-        .next()
-        .unwrap_or(state_type)
-        .trim_end_matches("State")
-        .to_string()
 }
 
 // ── MCP surface ────────────────────────────────────────────────────────────
