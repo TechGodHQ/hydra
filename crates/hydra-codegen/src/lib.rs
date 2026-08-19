@@ -203,7 +203,50 @@ fn cli_operations(definition: &ApiDefinition) -> impl Iterator<Item = &Operation
 fn generate_http(definition: &ApiDefinition, config: &GenerateConfig) -> String {
     let mut out = generated_header("HTTP route handlers generated from the API definition");
     out.push_str("use std::collections::BTreeMap;\n\n");
-    out.push_str("use axum::{extract::{Path, Query, State}, response::Response, routing::{get, post}, Json, Router};\n");
+    // Emit only the extractor/method imports the definition actually uses.
+    let unary_ops: Vec<&Operation> = http_operations(definition)
+        .filter(|operation| !operation.is_sse())
+        .collect();
+    let any_path = unary_ops.iter().any(|o| {
+        o.parameters
+            .iter()
+            .any(|p| p.location == ParameterLocation::Path)
+    });
+    let any_query = unary_ops.iter().any(|o| {
+        o.parameters
+            .iter()
+            .any(|p| p.location == ParameterLocation::Query)
+    });
+    let any_body = unary_ops.iter().any(|o| {
+        o.parameters
+            .iter()
+            .any(|p| p.location == ParameterLocation::Body)
+    });
+    let any_get = unary_ops.iter().any(|o| o.method == HttpMethod::Get);
+    let any_post = unary_ops.iter().any(|o| o.method == HttpMethod::Post);
+    let mut extractors = vec!["State"];
+    if any_path {
+        extractors.push("Path");
+    }
+    if any_query {
+        extractors.push("Query");
+    }
+    let mut methods = Vec::new();
+    if any_get {
+        methods.push("get");
+    }
+    if any_post {
+        methods.push("post");
+    }
+    push_fmt!(
+        out,
+        "use axum::{{extract::{{{}}}, response::Response, routing::{{{}}}, Router}};\n",
+        extractors.join(", "),
+        methods.join(", ")
+    );
+    if any_body {
+        out.push_str("use axum::Json;\n");
+    }
     out.push_str("use serde_json::Value;\n\n");
     out.push_str("#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n");
     out.push_str("pub struct GeneratedRoute {\n");
