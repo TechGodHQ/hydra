@@ -539,10 +539,17 @@ fn generate_sse_surface(definition: &ApiDefinition, config: &GenerateConfig) -> 
 
 /// Emit the `GeneratedRawOperationInput` struct, present only when the
 /// definition contains raw-request operations.
+///
+/// The emitted doc notes the header-map contract: names lowercased,
+/// non-UTF-8 values dropped, repeated headers last-wins.
 fn push_raw_input_struct(out: &mut String) {
-    out.push_str("/// Input for raw-request operations: the exact wire bytes and\n");
-    out.push_str("/// headers, for consumers that verify signatures over the\n");
-    out.push_str("/// request as received.\n");
+    out.push_str("/// Input for raw-request operations: the exact raw body bytes\n");
+    out.push_str("/// and a header map, for consumers that verify signatures over\n");
+    out.push_str("/// the request as received.\n");
+    out.push_str("///\n");
+    out.push_str("/// Header contract: names are lowercase (HTTP canonical form),\n");
+    out.push_str("/// values must be UTF-8 (non-UTF-8 values are dropped), and\n");
+    out.push_str("/// repeated headers collapse to the last value.\n");
     out.push_str("#[derive(Debug, Clone, Default, PartialEq, Eq)]\n");
     out.push_str("pub struct GeneratedRawOperationInput {\n");
     out.push_str("    pub path: BTreeMap<String, String>,\n");

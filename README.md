@@ -63,6 +63,8 @@ operations:
 ```yaml
 http_dispatch_fn: "crate::execute_operation_http"
 http_state_type: "crate::AppState"
+# Only needed if the definition has raw_request operations:
+# http_raw_dispatch_fn: "crate::execute_operation_raw_http"
 ```
 
 3. Generate and commit:
@@ -74,6 +76,32 @@ cargo run -p hydra-codegen -- check   # CI guard: fails if artifacts are stale
 
 4. `include!` the generated files, implement one dispatch function, and wire
    your binaries. See `examples/notes/src/lib.rs`.
+
+## Raw-request (webhook) operations
+
+Operations that must see the exact wire representation — signature-verified
+webhooks, for example — opt in with `raw_request: true`. The generated HTTP
+handler receives the raw body bytes and a header map instead of typed
+extraction, and dispatches to `http_raw_dispatch_fn`:
+
+```yaml
+- name: receive_webhook
+  description: Receive a signed webhook payload.
+  method: POST
+  path: /hooks/github
+  read: false
+  output_type: Value
+  parameters: []
+  surfaces: [http]
+  raw_request: true
+```
+
+Rules: `http` must be the only listed surface, the operation is unary (no
+SSE), and body-location parameters are rejected — the raw bytes replace
+JSON body extraction. The header map lowercases names, drops non-UTF-8
+values, and collapses repeated headers to the last value. Definitions
+without raw operations generate byte-identical output to before the flag
+existed.
 
 ## Design rules
 

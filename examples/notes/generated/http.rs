@@ -23,9 +23,13 @@ pub struct GeneratedOperationInput {
     pub body: Value,
 }
 
-/// Input for raw-request operations: the exact wire bytes and
-/// headers, for consumers that verify signatures over the
-/// request as received.
+/// Input for raw-request operations: the exact raw body bytes
+/// and a header map, for consumers that verify signatures over
+/// the request as received.
+///
+/// Header contract: names are lowercase (HTTP canonical form),
+/// values must be UTF-8 (non-UTF-8 values are dropped), and
+/// repeated headers collapse to the last value.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GeneratedRawOperationInput {
     pub path: BTreeMap<String, String>,

@@ -269,9 +269,9 @@ fn raw_request_byte_identical_when_flag_absent() {
     let expected = include_str!("fixtures/notes-pre-raw-http.rs");
     let definition: ApiDefinition =
         serde_yaml::from_str(include_str!("fixtures/notes-pre-raw-operations.yaml")).unwrap();
-    // Config as of v0.1.0 (the fixture's provenance). http_raw_dispatch_fn
-    // is deliberately unset: the new knob must not leak into output for
-    // definitions that don't use it.
+    // Config as of v0.1.0 (the fixture's provenance). The raw dispatch
+    // knob is left at its default: it must not leak into output for
+    // definitions that don't use raw operations.
     let config = GenerateConfig {
         http_dispatch_fn: "crate::execute_operation_http".to_string(),
         http_state_type: "crate::AppState".to_string(),

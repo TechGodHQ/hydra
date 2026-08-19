@@ -161,7 +161,7 @@ async fn raw_request_delivers_exact_wire_bytes_and_headers() {
     // The COD-402 acceptance criterion, proven live: a raw-request
     // operation receives the exact bytes and headers as sent — including
     // a non-UTF8-safe payload that typed Json extraction would mangle or
-    // reject, and header casing preserved as received.
+    // reject. Header names arrive lowercased (HTTP canonical form).
     let state = AppState::with_fixtures();
     let payload: &[u8] = &[
         0x7b, 0x22, 0x61, 0x22, 0x3a, 0x31, 0x2c, 0x22, 0x62, 0x22, 0x3a, 0x32,
@@ -203,12 +203,10 @@ async fn raw_request_delivers_exact_wire_bytes_and_headers() {
     assert_eq!(body["headers"]["x-multi"], json!("two"));
 }
 
-#[tokio::test]
-async fn raw_request_route_absent_from_cli_and_mcp() {
+#[test]
+fn raw_request_route_absent_from_cli_and_mcp() {
     // echo_raw lists surfaces: [http] only — the generated CLI enum and MCP
     // schema must not mention it.
-    let state = AppState::with_fixtures();
-    let _ = state;
     let cli_rs = include_str!("../generated/cli.rs");
     let mcp_json = include_str!("../generated/mcp.json");
     assert!(!cli_rs.contains("echo_raw") && !cli_rs.contains("EchoRaw"));

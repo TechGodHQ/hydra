@@ -98,7 +98,8 @@ pub struct Operation {
     /// (e.g. webhook HMAC) over the wire representation. Default behavior
     /// (flag absent) is unchanged. Raw-request operations must list `http`
     /// as their only surface, stay unary, and declare no body-location
-    /// parameters.
+    /// parameters. The header map lowercases names, drops non-UTF-8
+    /// values, and collapses repeated headers to the last value.
     #[serde(default)]
     pub raw_request: bool,
 }
