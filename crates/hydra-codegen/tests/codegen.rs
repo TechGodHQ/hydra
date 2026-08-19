@@ -401,13 +401,13 @@ fn json_parameter_cli_override_generates_repeatable_and_companion_flags() {
     let artifacts = generate_all(&definition_with_attachments(), &GenerateConfig::default());
     // Repeatable --attach flag with Append action
     assert!(
-        artifacts
-            .cli_rs
-            .contains("#[arg(long = \"attach\", action = clap::ArgAction::Append)]")
+        artifacts.cli_rs.contains(
+            "#[arg(long = \"attach\", action = clap::ArgAction::Append, required = false)]"
+        )
     );
-    // Companion --attach-mime flag, also repeatable
+    // Companion --attach-mime flag, also repeatable, declared flag emitted
     assert!(artifacts.cli_rs.contains(
-        "#[arg(long, action = clap::ArgAction::Append)]\n    pub attach_mime: Option<Vec<String>>"
+        "#[arg(long = \"attach-mime\", action = clap::ArgAction::Append)]\n    pub attach_mime: Option<Vec<String>>"
     ));
     // parameters_json maps the repeatable flag back to the wire name and
     // carries the companion alongside
@@ -558,4 +558,104 @@ fn rejects_non_kebab_flag_and_invalid_companion_field() {
         }],
     });
     assert!(hydra_core::validate::validate_definition(&definition).is_err());
+}
+
+// ── review-panel regression tests (round 2) ────────────────────────────────
+
+#[test]
+fn companion_flag_name_is_emitted_not_derived() {
+    // A companion whose flag diverges from the kebab derivation of its
+    // field must emit the declared flag verbatim.
+    let mut definition = definition_with_attachments();
+    let parameter = &mut definition.operations[0].parameters[1];
+    parameter.cli = Some(hydra_core::CliOverride {
+        flag: Some("attach".into()),
+        multiple: true,
+        companions: vec![hydra_core::CliCompanion {
+            flag: "mime-override".into(),
+            field: "attach_mime".into(),
+            description: "MIME override.".into(),
+        }],
+    });
+    let artifacts = generate_all(&definition, &GenerateConfig::default());
+    assert!(artifacts.cli_rs.contains(
+        "#[arg(long = \"mime-override\", action = clap::ArgAction::Append)]\n    pub attach_mime: Option<Vec<String>>"
+    ));
+}
+
+#[test]
+fn rejects_override_flag_colliding_with_default_parameter_flag() {
+    // A default-shaped parameter's derived flag must collide with an
+    // explicit override on another parameter.
+    let mut definition = definition_with_attachments();
+    // attachments has cli.flag = attach; rename the scalar `limit`
+    // parameter's flag to `attach` — collision via the derived default?
+    // No: limit's default flag is `limit`. Set attachments' flag to
+    // `limit` instead.
+    let parameter = &mut definition.operations[0].parameters[1];
+    parameter.cli = Some(hydra_core::CliOverride {
+        flag: Some("limit".into()),
+        multiple: true,
+        companions: vec![],
+    });
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+}
+
+#[test]
+fn rejects_companion_field_colliding_with_parameter_field() {
+    let mut definition = definition_with_attachments();
+    let parameter = &mut definition.operations[0].parameters[1];
+    parameter.cli = Some(hydra_core::CliOverride {
+        flag: Some("attach".into()),
+        multiple: true,
+        companions: vec![hydra_core::CliCompanion {
+            flag: "limit-override".into(),
+            field: "limit".into(), // collides with the `limit` parameter
+            description: "Bad.".into(),
+        }],
+    });
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+}
+
+#[test]
+fn rejects_cli_block_on_path_parameter() {
+    let mut definition = definition_with_attachments();
+    // Make the scalar limit parameter a path param with a cli block.
+    definition.operations[0].parameters[0].location = ParameterLocation::Path;
+    definition.operations[0].parameters[0].cli = Some(hydra_core::CliOverride {
+        flag: Some("max".into()),
+        multiple: false,
+        companions: vec![],
+    });
+    // Path param needs matching placeholder; adjust the path.
+    definition.operations[0].path = "/items/{limit}".into();
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+}
+
+#[test]
+fn cli_block_without_flag_uses_default_long_attribute() {
+    // cli: present, flag omitted: clap derives the flag from the field
+    // name (kebab), so the plain #[arg(long)] attribute is emitted —
+    // identical to the default shape.
+    let mut definition = sample_definition();
+    definition.operations[0].parameters[0].cli = Some(hydra_core::CliOverride {
+        flag: None,
+        multiple: false,
+        companions: vec![],
+    });
+    let artifacts = generate_all(&definition, &GenerateConfig::default());
+    assert!(
+        artifacts
+            .cli_rs
+            .contains("#[arg(long)]\n    pub limit: Option<u32>,")
+    );
+}
+
+#[test]
+fn required_multiple_flag_carries_required_true() {
+    let mut definition = definition_with_attachments();
+    let parameter = &mut definition.operations[0].parameters[1];
+    parameter.required = true;
+    let artifacts = generate_all(&definition, &GenerateConfig::default());
+    assert!(artifacts.cli_rs.contains("required = true"));
 }

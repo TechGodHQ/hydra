@@ -186,7 +186,7 @@ fn generate_cli(definition: &ApiDefinition) -> String {
                 parameter.location == ParameterLocation::Path,
                 parameter.required,
                 parameter.cli.as_ref(),
-                false,
+                None,
             );
             if let Some(cli) = &parameter.cli {
                 for companion in &cli.companions {
@@ -198,7 +198,7 @@ fn generate_cli(definition: &ApiDefinition) -> String {
                         false,
                         false,
                         None,
-                        true,
+                        Some(&companion.flag),
                     );
                 }
             }
@@ -213,9 +213,11 @@ fn generate_cli(definition: &ApiDefinition) -> String {
 ///
 /// Path-location parameters stay positional (no attribute), preserving
 /// the pre-existing contract. Companion fields are always optional
-/// repeatable strings declared explicitly in the definition. Parameter
+/// repeatable strings with an explicitly declared flag name. Parameter
 /// fields with a CLI representation override follow it: an explicit flag
-/// name, and `multiple` → `Option<Vec<String>>` with `ArgAction::Append`.
+/// name when declared, and `multiple` → `Option<Vec<String>>` with
+/// `ArgAction::Append`. When no flag is declared, clap derives the long
+/// flag from the field name (`snake_case` → kebab-case).
 fn emit_cli_field(
     out: &mut String,
     field: &str,
@@ -223,23 +225,29 @@ fn emit_cli_field(
     positional: bool,
     required: bool,
     cli: Option<&hydra_core::CliOverride>,
-    companion: bool,
+    companion_flag: Option<&str>,
 ) {
-    let mut field_type = if required {
+    let mut field_type = if required && companion_flag.is_none() && !cli.is_some_and(|c| c.multiple)
+    {
         rust_type.to_owned()
     } else {
         format!("Option<{rust_type}>")
     };
-    let attribute = if companion {
+    let attribute = if let Some(flag) = companion_flag {
         field_type = "Option<Vec<String>>".to_string();
-        "    #[arg(long, action = clap::ArgAction::Append)]\n".to_owned()
+        format!("    #[arg(long = \"{flag}\", action = clap::ArgAction::Append)]\n")
     } else if let Some(cli) = cli {
-        let flag = cli.effective_flag(field);
         if cli.multiple {
             field_type = "Option<Vec<String>>".to_string();
-            format!("    #[arg(long = \"{flag}\", action = clap::ArgAction::Append)]\n")
-        } else {
+            format!(
+                "    #[arg(long = \"{}\", action = clap::ArgAction::Append, required = {required})]\n",
+                cli.effective_flag(field)
+            )
+        } else if let Some(flag) = &cli.flag {
+            // An explicitly declared flag name is emitted verbatim.
             format!("    #[arg(long = \"{flag}\")]\n")
+        } else {
+            "    #[arg(long)]\n".to_owned()
         }
     } else if positional {
         String::new()
@@ -272,6 +280,8 @@ fn push_parameters_json_entry(out: &mut String, parameter: &Parameter) {
     match &parameter.cli {
         Some(cli) => {
             if cli.multiple {
+                // `required = true` multiple flags are enforced by clap at
+                // parse time; unwrap_or_default() covers the optional case.
                 out.push_str(".clone().unwrap_or_default()");
             } else {
                 out.push_str(".clone()");
@@ -661,8 +671,11 @@ fn generate_mcp(definition: &ApiDefinition) -> String {
                     required.push(parameter.name.clone());
                 }
                 let property = if parameter.ty == hydra_core::ParameterType::Json {
-                    // Declared JSON Schema subtree, verbatim, with the
-                    // parameter description merged in — never inferred.
+                    // Declared JSON Schema subtree, verbatim. The parameter
+                    // description is merged in only when the subtree does
+                    // not carry its own `description` — a schema-level
+                    // description wins, preserving verbatim embedding as
+                    // the primary contract.
                     let mut subtree = parameter
                         .schema
                         .clone()

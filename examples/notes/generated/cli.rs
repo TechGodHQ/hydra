@@ -85,10 +85,10 @@ pub struct AnnotateNoteArgs {
     #[arg(long)]
     pub body: String,
     /// Attachments to attach; each is inline bytes or a stored reference.
-    #[arg(long = "attach", action = clap::ArgAction::Append)]
+    #[arg(long = "attach", action = clap::ArgAction::Append, required = false)]
     pub attachments: Option<Vec<String>>,
     /// MIME type for the corresponding local-path --attach value.
-    #[arg(long, action = clap::ArgAction::Append)]
+    #[arg(long = "attach-mime", action = clap::ArgAction::Append)]
     pub attach_mime: Option<Vec<String>>,
 }
 
