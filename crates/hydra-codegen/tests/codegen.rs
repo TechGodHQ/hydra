@@ -49,10 +49,9 @@ fn config_dispatch_fn_flows_into_http_handlers() {
     };
     let artifacts = generate_all(&sample_definition(), &config);
     assert!(artifacts.http_rs.contains("crate::my_dispatch("));
-    assert!(artifacts.http_rs.contains("use crate::MyState;"));
-    assert!(
-        artifacts.http_rs.contains("State<MyState>") || artifacts.http_rs.contains("Router<My>")
-    );
+
+    assert!(artifacts.http_rs.contains("State<crate::MyState>"));
+    assert!(artifacts.http_rs.contains("Router<crate::MyState>"));
 }
 
 #[test]
