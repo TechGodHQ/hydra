@@ -1,0 +1,70 @@
+operations:
+  - name: list_notes
+    description: List notes, newest first.
+    method: GET
+    path: /notes
+    read: true
+    output_type: Vec<Note>
+    parameters:
+      - name: limit
+        description: Maximum number of notes to return.
+        type: u32
+        required: false
+        location: query
+  - name: get_note
+    description: Get a single note by ID.
+    method: GET
+    path: /notes/{note_id}
+    read: true
+    output_type: Note
+    parameters:
+      - name: note_id
+        description: Note ID to fetch.
+        type: string
+        required: true
+        location: path
+  - name: create_note
+    description: Create a note with a title and body.
+    method: POST
+    path: /notes
+    read: false
+    output_type: Note
+    parameters:
+      - name: title
+        description: Note title.
+        type: string
+        required: true
+        location: body
+      - name: body
+        description: Note body text.
+        type: string
+        required: true
+        location: body
+  - name: delete_note
+    description: Delete a note by ID.
+    method: POST
+    path: /notes/{note_id}/delete
+    read: false
+    output_type: "()" 
+    parameters:
+      - name: note_id
+        description: Note ID to delete.
+        type: string
+        required: true
+        location: path
+  - name: note_stats
+    description: Return total note count and character volume.
+    method: GET
+    path: /stats
+    read: true
+    output_type: Stats
+    parameters: []
+    surfaces: [http, mcp]
+  - name: compact_notes
+    description: Internal compaction job; exposed on CLI only for operators.
+    method: POST
+    path: /internal/compact
+    read: false
+    output_type: "()"
+    parameters: []
+    surfaces: [cli]

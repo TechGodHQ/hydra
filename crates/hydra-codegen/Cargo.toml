@@ -1,0 +1,21 @@
+[package]
+name = "hydra-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Generates CLI, HTTP, and MCP surfaces from a hydra API definition"
+
+[lints]
+workspace = true
+
+[dependencies]
+hydra-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"

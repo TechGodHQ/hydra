@@ -1,0 +1,4 @@
+# Hydra generation config for the notes example.
+http_dispatch_fn: "crate::execute_operation_http"
+http_state_type: "crate::AppState"
+sse_binding_prefix: "super::"

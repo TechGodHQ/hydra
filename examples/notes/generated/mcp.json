@@ -1,0 +1,101 @@
+{
+  "locations": {
+    "create_note": {
+      "body": "body",
+      "title": "body"
+    },
+    "delete_note": {
+      "note_id": "path"
+    },
+    "get_note": {
+      "note_id": "path"
+    },
+    "list_notes": {
+      "limit": "query"
+    },
+    "note_stats": {}
+  },
+  "tools": [
+    {
+      "description": "List notes, newest first.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "description": "Maximum number of notes to return.",
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "list_notes"
+    },
+    {
+      "description": "Get a single note by ID.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "note_id": {
+            "description": "Note ID to fetch.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "note_id"
+        ],
+        "type": "object"
+      },
+      "name": "get_note"
+    },
+    {
+      "description": "Create a note with a title and body.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "description": "Note body text.",
+            "type": "string"
+          },
+          "title": {
+            "description": "Note title.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "body"
+        ],
+        "type": "object"
+      },
+      "name": "create_note"
+    },
+    {
+      "description": "Delete a note by ID.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "note_id": {
+            "description": "Note ID to delete.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "note_id"
+        ],
+        "type": "object"
+      },
+      "name": "delete_note"
+    },
+    {
+      "description": "Return total note count and character volume.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "note_stats"
+    }
+  ]
+}
