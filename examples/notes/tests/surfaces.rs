@@ -121,9 +121,7 @@ async fn errors_are_equivalent_across_surfaces() {
         &state,
         "get_note",
         GeneratedOperationInput {
-            path: [("note_id".to_string(), "nope".to_string())]
-                .into_iter()
-                .collect(),
+            path: std::iter::once(("note_id".to_string(), "nope".to_string())).collect(),
             query: std::collections::BTreeMap::default(),
             body: Value::Null,
         },
