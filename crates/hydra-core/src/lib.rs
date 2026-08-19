@@ -92,6 +92,16 @@ pub struct Operation {
     /// command differently from the operation.
     #[serde(default)]
     pub cli_command: Option<String>,
+    /// Opt in to raw-request access on the HTTP surface. The generated
+    /// handler receives the exact raw body bytes and a header map instead
+    /// of decoded/typed extractors, for consumers that verify signatures
+    /// (e.g. webhook HMAC) over the wire representation. Default behavior
+    /// (flag absent) is unchanged. Raw-request operations must list `http`
+    /// as their only surface, stay unary, and declare no body-location
+    /// parameters. The header map lowercases names, drops non-UTF-8
+    /// values, and collapses repeated headers to the last value.
+    #[serde(default)]
+    pub raw_request: bool,
 }
 
 /// Response delivery kind for a generated operation.
@@ -122,6 +132,13 @@ impl Operation {
     #[must_use]
     pub const fn is_sse(&self) -> bool {
         matches!(self.delivery, Delivery::Sse)
+    }
+
+    /// Whether this operation opts into raw-request access on the HTTP
+    /// surface (exact body bytes + headers instead of typed extraction).
+    #[must_use]
+    pub const fn is_raw_request(&self) -> bool {
+        self.raw_request
     }
 
     /// Whether the HTTP surface is generated for this operation.

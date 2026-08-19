@@ -52,6 +52,7 @@ pub fn validate_definition(definition: &ApiDefinition) -> Result<()> {
         );
         validate_operation_parameters(operation)?;
         validate_operation_surfaces(operation)?;
+        validate_operation_raw_request(operation)?;
     }
 
     // CLI command overrides must not collide with any generated subcommand.
@@ -120,6 +121,43 @@ fn validate_operation_parameters(operation: &Operation) -> Result<()> {
             operation.path
         );
     }
+    Ok(())
+}
+
+/// Validate the raw-request escape hatch: it is an HTTP-surface-only
+/// feature, so raw operations must not appear on CLI or MCP, must not
+/// stream, and must not declare body-location parameters (the raw bytes
+/// replace JSON body extraction).
+fn validate_operation_raw_request(operation: &Operation) -> Result<()> {
+    if !operation.is_raw_request() {
+        return Ok(());
+    }
+    // `surfaces: None` means "all surfaces"; raw request access is an
+    // HTTP-only escape hatch, so the allowlist must be exactly [http].
+    anyhow::ensure!(
+        operation
+            .surfaces
+            .as_ref()
+            .is_some_and(|surfaces| surfaces.len() == 1 && surfaces.contains(&Surface::Http)),
+        "operation {} uses raw_request but does not list exactly the http surface; \
+         raw request access is http-only",
+        operation.name
+    );
+    anyhow::ensure!(
+        !operation.is_sse(),
+        "operation {} uses raw_request with delivery: sse; \
+         raw request access is unary-only",
+        operation.name
+    );
+    anyhow::ensure!(
+        operation
+            .parameters
+            .iter()
+            .all(|parameter| parameter.location != ParameterLocation::Body),
+        "operation {} uses raw_request but declares a body-location parameter; \
+         the raw body bytes replace JSON body extraction",
+        operation.name
+    );
     Ok(())
 }
 

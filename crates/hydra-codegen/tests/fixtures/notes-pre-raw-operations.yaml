@@ -68,12 +68,3 @@ operations:
     output_type: "()"
     parameters: []
     surfaces: [cli]
-  - name: echo_raw
-    description: Echo the exact raw request bytes and headers; webhook-style ingress reference.
-    method: POST
-    path: /hooks/echo
-    read: false
-    output_type: Value
-    parameters: []
-    surfaces: [http]
-    raw_request: true

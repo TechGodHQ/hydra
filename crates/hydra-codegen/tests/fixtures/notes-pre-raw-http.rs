@@ -5,8 +5,6 @@ use std::collections::BTreeMap;
 
 use axum::{extract::{State, Path, Query}, response::Response, routing::{get, post}, Router};
 use axum::Json;
-use axum::body::Bytes;
-use axum::http::HeaderMap;
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,28 +21,12 @@ pub struct GeneratedOperationInput {
     pub body: Value,
 }
 
-/// Input for raw-request operations: the exact raw body bytes
-/// and a header map, for consumers that verify signatures over
-/// the request as received.
-///
-/// Header contract: names are lowercase (HTTP canonical form),
-/// values must be UTF-8 (non-UTF-8 values are dropped), and
-/// repeated headers collapse to the last value.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct GeneratedRawOperationInput {
-    pub path: BTreeMap<String, String>,
-    pub query: BTreeMap<String, String>,
-    pub headers: BTreeMap<String, String>,
-    pub raw_body: Vec<u8>,
-}
-
 pub const GENERATED_ROUTES: &[GeneratedRoute] = &[
     GeneratedRoute { name: "list_notes", method: "GET", path: "/notes" },
     GeneratedRoute { name: "get_note", method: "GET", path: "/notes/{note_id}" },
     GeneratedRoute { name: "create_note", method: "POST", path: "/notes" },
     GeneratedRoute { name: "delete_note", method: "POST", path: "/notes/{note_id}/delete" },
     GeneratedRoute { name: "note_stats", method: "GET", path: "/stats" },
-    GeneratedRoute { name: "echo_raw", method: "POST", path: "/hooks/echo" },
 ];
 
 pub fn generated_router() -> Router<crate::AppState> {
@@ -54,7 +36,6 @@ pub fn generated_router() -> Router<crate::AppState> {
         .route("/notes", post(create_note))
         .route("/notes/{note_id}/delete", post(delete_note))
         .route("/stats", get(note_stats))
-        .route("/hooks/echo", post(echo_raw))
 }
 
 async fn list_notes(
@@ -131,33 +112,6 @@ async fn note_stats(
             path: BTreeMap::new(),
             query: BTreeMap::new(),
             body: Value::Null,
-        },
-    )
-    .await
-}
-
-async fn echo_raw(
-    State(state): State<crate::AppState>,
-    headers: HeaderMap,
-    raw_body: Bytes,
-) -> Response {
-    let headers: BTreeMap<String, String> = headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.as_str().to_owned(), value.to_owned()))
-        })
-        .collect();
-    crate::execute_operation_raw_http(
-        &state,
-        "echo_raw",
-        GeneratedRawOperationInput {
-            path: BTreeMap::new(),
-            query: BTreeMap::new(),
-            headers,
-            raw_body: raw_body.to_vec(),
         },
     )
     .await

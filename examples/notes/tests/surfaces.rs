@@ -155,3 +155,60 @@ async fn stats_available_on_http_but_not_cli() {
     let body_value = body_json(res).await;
     assert_eq!(body_value["count"], json!(2));
 }
+
+#[tokio::test]
+async fn raw_request_delivers_exact_wire_bytes_and_headers() {
+    // The COD-402 acceptance criterion, proven live: a raw-request
+    // operation receives the exact bytes and headers as sent — including
+    // a non-UTF8-safe payload that typed Json extraction would mangle or
+    // reject. Header names arrive lowercased (HTTP canonical form).
+    let state = AppState::with_fixtures();
+    let payload: &[u8] = &[
+        0x7b, 0x22, 0x61, 0x22, 0x3a, 0x31, 0x2c, 0x22, 0x62, 0x22, 0x3a, 0x32,
+        0x7d, // {"a":1,"b":2}
+        0xff, 0xfe, 0x00, // trailing bytes that are NOT valid UTF-8
+    ];
+    let res = http(
+        &state,
+        Request::post("/hooks/echo")
+            .header("content-type", "application/json")
+            .header("x-webhook-signature", "sha256=deadbeef")
+            .header("x-multi", "one")
+            .header("x-multi", "two")
+            .body(Body::from(payload.to_vec()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_json(res).await;
+
+    // Byte-exactness: the echoed bytes equal the wire bytes verbatim.
+    assert_eq!(body["bytes_len"], json!(payload.len()));
+    let echoed: Vec<u8> = body["bytes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| u8::try_from(v.as_u64().unwrap_or(u64::MAX)).unwrap_or(u8::MAX))
+        .collect();
+    assert_eq!(echoed, payload.to_vec());
+
+    // Headers arrive with values intact (single-valued header).
+    assert_eq!(
+        body["headers"]["x-webhook-signature"],
+        json!("sha256=deadbeef")
+    );
+    assert_eq!(body["headers"]["content-type"], json!("application/json"));
+    // Multi-valued headers collapse to one entry in the BTreeMap; the last
+    // value seen wins. The contract is "a header map", not multi-map.
+    assert_eq!(body["headers"]["x-multi"], json!("two"));
+}
+
+#[test]
+fn raw_request_route_absent_from_cli_and_mcp() {
+    // echo_raw lists surfaces: [http] only — the generated CLI enum and MCP
+    // schema must not mention it.
+    let cli_rs = include_str!("../generated/cli.rs");
+    let mcp_json = include_str!("../generated/mcp.json");
+    assert!(!cli_rs.contains("echo_raw") && !cli_rs.contains("EchoRaw"));
+    assert!(!mcp_json.contains("echo_raw"));
+}
