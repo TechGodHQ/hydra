@@ -230,6 +230,39 @@ pub async fn execute_operation_http(
     }
 }
 
+/// HTTP adapter for raw-request operations: the wire bytes and headers
+/// arrive untouched, so signature verification over the exact received
+/// representation is possible.
+///
+/// This example echoes them back as JSON.
+#[allow(clippy::unused_async)]
+pub async fn execute_operation_raw_http(
+    state: &AppState,
+    operation: &str,
+    input: generated::GeneratedRawOperationInput,
+) -> axum::response::Response {
+    match operation {
+        "echo_raw" => axum::Json(serde_json::json!({
+            "bytes": input.raw_body,
+            "bytes_len": input.raw_body.len(),
+            "headers": input.headers,
+        }))
+        .into_response(),
+        _ => {
+            execute_operation_http(
+                state,
+                operation,
+                generated::GeneratedOperationInput {
+                    path: input.path,
+                    query: input.query,
+                    body: Value::Null,
+                },
+            )
+            .await
+        }
+    }
+}
+
 // ── Surface wiring ────────────────────────────────────────────────────────
 
 /// Build the full HTTP router for the notes service.

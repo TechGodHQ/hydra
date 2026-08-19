@@ -33,6 +33,12 @@ pub struct GenerateConfig {
     /// Where the SSE binding hooks live, e.g. `super::`.
     #[serde(default = "default_sse_binding_prefix")]
     pub sse_binding_prefix: String,
+    /// Where generated raw-request handlers send operation inputs, e.g.
+    /// `super::execute_generated_raw_operation`. Only used when the
+    /// definition contains `raw_request: true` operations. Emits
+    /// `<target>(&state, "<op>", GeneratedRawOperationInput { .. })`.
+    #[serde(default = "default_http_raw_dispatch_fn")]
+    pub http_raw_dispatch_fn: String,
     /// Header line identifying the generator in committed artifacts.
     #[serde(default = "default_generator_name")]
     pub generator_name: String,
@@ -40,6 +46,10 @@ pub struct GenerateConfig {
 
 fn default_sse_binding_prefix() -> String {
     "super::".to_string()
+}
+
+fn default_http_raw_dispatch_fn() -> String {
+    "super::execute_generated_raw_operation".to_string()
 }
 
 fn default_generator_name() -> String {
@@ -52,6 +62,7 @@ impl Default for GenerateConfig {
             http_dispatch_fn: "super::execute_generated_operation".to_string(),
             http_state_type: "crate::app::AppState".to_string(),
             sse_binding_prefix: default_sse_binding_prefix(),
+            http_raw_dispatch_fn: default_http_raw_dispatch_fn(),
             generator_name: default_generator_name(),
         }
     }
@@ -200,6 +211,55 @@ fn cli_operations(definition: &ApiDefinition) -> impl Iterator<Item = &Operation
 
 // ── HTTP surface ───────────────────────────────────────────────────────────
 
+/// Which axum imports the generated HTTP module needs, derived from what
+/// the definition's unary operations actually use.
+#[derive(Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
+struct HttpImportPlan {
+    /// Path extractor needed.
+    path: bool,
+    /// Query extractor needed.
+    query: bool,
+    /// Json extractor needed (non-raw body params).
+    body_json: bool,
+    /// `HeaderMap` + `Bytes` needed (raw-request operations).
+    raw: bool,
+    /// `get` router method needed.
+    get: bool,
+    /// `post` router method needed.
+    post: bool,
+}
+
+impl HttpImportPlan {
+    /// Analyze the definition's unary HTTP operations.
+    fn analyze(unary_ops: &[&Operation]) -> Self {
+        let any = |predicate: &dyn Fn(&&Operation) -> bool| unary_ops.iter().any(predicate);
+        Self {
+            path: any(&|o| {
+                o.parameters
+                    .iter()
+                    .any(|p| p.location == ParameterLocation::Path)
+            }),
+            query: any(&|o| {
+                o.parameters
+                    .iter()
+                    .any(|p| p.location == ParameterLocation::Query)
+            }),
+            // Raw-request handlers extract the body as bytes themselves,
+            // so only non-raw unary operations pull in the Json extractor.
+            body_json: any(&|o| {
+                !o.is_raw_request()
+                    && o.parameters
+                        .iter()
+                        .any(|p| p.location == ParameterLocation::Body)
+            }),
+            raw: any(&|o| o.is_raw_request()),
+            get: any(&|o| o.method == HttpMethod::Get),
+            post: any(&|o| o.method == HttpMethod::Post),
+        }
+    }
+}
+
 fn generate_http(definition: &ApiDefinition, config: &GenerateConfig) -> String {
     let mut out = generated_header("HTTP route handlers generated from the API definition");
     out.push_str("use std::collections::BTreeMap;\n\n");
@@ -207,35 +267,19 @@ fn generate_http(definition: &ApiDefinition, config: &GenerateConfig) -> String 
     let unary_ops: Vec<&Operation> = http_operations(definition)
         .filter(|operation| !operation.is_sse())
         .collect();
-    let any_path = unary_ops.iter().any(|o| {
-        o.parameters
-            .iter()
-            .any(|p| p.location == ParameterLocation::Path)
-    });
-    let any_query = unary_ops.iter().any(|o| {
-        o.parameters
-            .iter()
-            .any(|p| p.location == ParameterLocation::Query)
-    });
-    let any_body = unary_ops.iter().any(|o| {
-        o.parameters
-            .iter()
-            .any(|p| p.location == ParameterLocation::Body)
-    });
-    let any_get = unary_ops.iter().any(|o| o.method == HttpMethod::Get);
-    let any_post = unary_ops.iter().any(|o| o.method == HttpMethod::Post);
+    let plan = HttpImportPlan::analyze(&unary_ops);
     let mut extractors = vec!["State"];
-    if any_path {
+    if plan.path {
         extractors.push("Path");
     }
-    if any_query {
+    if plan.query {
         extractors.push("Query");
     }
     let mut methods = Vec::new();
-    if any_get {
+    if plan.get {
         methods.push("get");
     }
-    if any_post {
+    if plan.post {
         methods.push("post");
     }
     push_fmt!(
@@ -244,8 +288,14 @@ fn generate_http(definition: &ApiDefinition, config: &GenerateConfig) -> String 
         extractors.join(", "),
         methods.join(", ")
     );
-    if any_body {
+    if plan.body_json {
         out.push_str("use axum::Json;\n");
+    }
+    if plan.raw {
+        // Raw handlers take HeaderMap + Bytes directly; Bytes must come
+        // last so the body is fully buffered before extraction.
+        out.push_str("use axum::body::Bytes;\n");
+        out.push_str("use axum::http::HeaderMap;\n");
     }
     out.push_str("use serde_json::Value;\n\n");
     out.push_str("#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n");
@@ -260,6 +310,9 @@ fn generate_http(definition: &ApiDefinition, config: &GenerateConfig) -> String 
     out.push_str("    pub query: BTreeMap<String, String>,\n");
     out.push_str("    pub body: Value,\n");
     out.push_str("}\n\n");
+    if plan.raw {
+        push_raw_input_struct(&mut out);
+    }
     out.push_str("pub const GENERATED_ROUTES: &[GeneratedRoute] = &[\n");
     for operation in http_operations(definition).filter(|o| !o.is_sse()) {
         out.push_str("    GeneratedRoute { name: ");
@@ -315,6 +368,10 @@ fn push_unary_handler(out: &mut String, operation: &Operation, config: &Generate
         .parameters
         .iter()
         .any(|parameter| parameter.location == ParameterLocation::Query);
+    if operation.is_raw_request() {
+        push_raw_handler(out, operation, config, has_path, has_query);
+        return;
+    }
     let has_body = operation
         .parameters
         .iter()
@@ -359,6 +416,68 @@ fn push_unary_handler(out: &mut String, operation: &Operation, config: &Generate
     } else {
         out.push_str("            body: Value::Null,\n");
     }
+    out.push_str("        },\n");
+    out.push_str("    )\n");
+    out.push_str("    .await\n");
+    out.push_str("}\n");
+}
+
+/// Emit one raw-request axum handler: the request body arrives as exact
+/// bytes with a header map, so consumers can verify signatures over the
+/// wire representation. Path/query params still extract normally.
+fn push_raw_handler(
+    out: &mut String,
+    operation: &Operation,
+    config: &GenerateConfig,
+    has_path: bool,
+    has_query: bool,
+) {
+    out.push_str("async fn ");
+    out.push_str(&operation.name);
+    out.push_str("(\n");
+    push_fmt!(
+        out,
+        "    State(state): State<{}>,\n",
+        config.http_state_type
+    );
+    if has_path {
+        out.push_str("    Path(path): Path<BTreeMap<String, String>>,\n");
+    }
+    if has_query {
+        out.push_str("    Query(query): Query<BTreeMap<String, String>>,\n");
+    }
+    // HeaderMap before Bytes: extractors run in declaration order and the
+    // body must be buffered last.
+    out.push_str("    headers: HeaderMap,\n");
+    out.push_str("    raw_body: Bytes,\n");
+    out.push_str(") -> Response {\n");
+    out.push_str("    let headers: BTreeMap<String, String> = headers\n");
+    out.push_str("        .iter()\n");
+    out.push_str("        .filter_map(|(name, value)| {\n");
+    out.push_str("            value\n");
+    out.push_str("                .to_str()\n");
+    out.push_str("                .ok()\n");
+    out.push_str("                .map(|value| (name.as_str().to_owned(), value.to_owned()))\n");
+    out.push_str("        })\n");
+    out.push_str("        .collect();\n");
+    push_fmt!(out, "    {}(\n", config.http_raw_dispatch_fn);
+    out.push_str("        &state,\n");
+    out.push_str("        ");
+    out.push_str(&rust_string_literal(&operation.name));
+    out.push_str(",\n");
+    out.push_str("        GeneratedRawOperationInput {\n");
+    if has_path {
+        out.push_str("            path,\n");
+    } else {
+        out.push_str("            path: BTreeMap::new(),\n");
+    }
+    if has_query {
+        out.push_str("            query,\n");
+    } else {
+        out.push_str("            query: BTreeMap::new(),\n");
+    }
+    out.push_str("            headers,\n");
+    out.push_str("            raw_body: raw_body.to_vec(),\n");
     out.push_str("        },\n");
     out.push_str("    )\n");
     out.push_str("    .await\n");
@@ -416,6 +535,21 @@ fn generate_sse_surface(definition: &ApiDefinition, config: &GenerateConfig) -> 
         out.push_str("}\n\n");
     }
     out
+}
+
+/// Emit the `GeneratedRawOperationInput` struct, present only when the
+/// definition contains raw-request operations.
+fn push_raw_input_struct(out: &mut String) {
+    out.push_str("/// Input for raw-request operations: the exact wire bytes and\n");
+    out.push_str("/// headers, for consumers that verify signatures over the\n");
+    out.push_str("/// request as received.\n");
+    out.push_str("#[derive(Debug, Clone, Default, PartialEq, Eq)]\n");
+    out.push_str("pub struct GeneratedRawOperationInput {\n");
+    out.push_str("    pub path: BTreeMap<String, String>,\n");
+    out.push_str("    pub query: BTreeMap<String, String>,\n");
+    out.push_str("    pub headers: BTreeMap<String, String>,\n");
+    out.push_str("    pub raw_body: Vec<u8>,\n");
+    out.push_str("}\n\n");
 }
 
 fn http_operations(definition: &ApiDefinition) -> impl Iterator<Item = &Operation> {
