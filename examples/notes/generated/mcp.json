@@ -1,5 +1,10 @@
 {
   "locations": {
+    "annotate_note": {
+      "attachments": "body",
+      "body": "body",
+      "note_id": "path"
+    },
     "create_note": {
       "body": "body",
       "title": "body"
@@ -96,6 +101,67 @@
         "type": "object"
       },
       "name": "note_stats"
+    },
+    {
+      "description": "Append an annotation to a note, optionally carrying attachments.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "attachments": {
+            "description": "Attachments to attach; each is inline bytes or a stored reference.",
+            "items": {
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "data_base64": {
+                      "type": "string"
+                    },
+                    "filename": {
+                      "type": "string"
+                    },
+                    "mime_type": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "mime_type",
+                    "data_base64"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "stored_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "stored_id"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "type": "array"
+          },
+          "body": {
+            "description": "Annotation text.",
+            "type": "string"
+          },
+          "note_id": {
+            "description": "Note ID to annotate.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "note_id",
+          "body"
+        ],
+        "type": "object"
+      },
+      "name": "annotate_note"
     }
   ]
 }

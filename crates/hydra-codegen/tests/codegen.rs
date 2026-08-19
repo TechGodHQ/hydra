@@ -20,6 +20,8 @@ fn sample_definition() -> ApiDefinition {
                 ty: hydra_core::ParameterType::U32,
                 required: false,
                 location: ParameterLocation::Query,
+                schema: None,
+                cli: None,
             }],
             delivery: Delivery::Unary,
             surfaces: None,
@@ -238,6 +240,8 @@ fn raw_request_operation_with_path_parameter_extracts_typed_path() {
             ty: hydra_core::ParameterType::String,
             required: true,
             location: ParameterLocation::Path,
+            schema: None,
+            cli: None,
         }],
         delivery: Delivery::Unary,
         surfaces: Some(vec![hydra_core::Surface::Http]),
@@ -309,6 +313,8 @@ fn rejects_raw_request_with_sse_or_body_params() {
         ty: hydra_core::ParameterType::String,
         required: true,
         location: ParameterLocation::Body,
+        schema: None,
+        cli: None,
     });
     assert!(hydra_core::validate::validate_definition(&definition).is_err());
     definition.operations[0].parameters.pop();
@@ -333,4 +339,223 @@ fn committed_example_artifacts_are_current() {
     if let Some(e) = err {
         panic!("{e}");
     }
+}
+
+// ── json parameters + CLI representation overrides (COD-411) ───────────────
+
+fn attachments_parameter() -> Parameter {
+    Parameter {
+        name: "attachments".into(),
+        description: "Attachments to send.".into(),
+        ty: hydra_core::ParameterType::Json,
+        required: false,
+        location: ParameterLocation::Body,
+        schema: Some(serde_json::json!({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "mime_type": {"type": "string"},
+                            "filename": {"type": "string"},
+                            "data_base64": {"type": "string"}
+                        },
+                        "required": ["mime_type", "data_base64"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "stored_id": {"type": "string"}
+                        },
+                        "required": ["stored_id"],
+                        "additionalProperties": false
+                    }
+                ]
+            }
+        })),
+        cli: Some(hydra_core::CliOverride {
+            flag: Some("attach".into()),
+            multiple: true,
+            companions: vec![hydra_core::CliCompanion {
+                flag: "attach-mime".into(),
+                field: "attach_mime".into(),
+                description: "MIME type override for the corresponding --attach.".into(),
+            }],
+        }),
+    }
+}
+
+fn definition_with_attachments() -> ApiDefinition {
+    let mut definition = sample_definition();
+    definition.operations[0]
+        .parameters
+        .push(attachments_parameter());
+    definition
+}
+
+#[test]
+fn json_parameter_cli_override_generates_repeatable_and_companion_flags() {
+    let artifacts = generate_all(&definition_with_attachments(), &GenerateConfig::default());
+    // Repeatable --attach flag with Append action
+    assert!(
+        artifacts
+            .cli_rs
+            .contains("#[arg(long = \"attach\", action = clap::ArgAction::Append)]")
+    );
+    // Companion --attach-mime flag, also repeatable
+    assert!(artifacts.cli_rs.contains(
+        "#[arg(long, action = clap::ArgAction::Append)]\n    pub attach_mime: Option<Vec<String>>"
+    ));
+    // parameters_json maps the repeatable flag back to the wire name and
+    // carries the companion alongside
+    assert!(
+        artifacts
+            .cli_rs
+            .contains("\"attachments\": args.attachments.clone().unwrap_or_default()")
+    );
+    assert!(
+        artifacts
+            .cli_rs
+            .contains("\"attach_mime\": args.attach_mime.clone()")
+    );
+}
+
+#[test]
+fn json_parameter_schema_flows_into_mcp_input_schema() {
+    let artifacts = generate_all(&definition_with_attachments(), &GenerateConfig::default());
+    let parsed: serde_json::Value = serde_json::from_str(&artifacts.mcp_json).unwrap();
+    let schema = &parsed["tools"][0]["inputSchema"]["properties"]["attachments"];
+    assert_eq!(schema["type"], "array");
+    assert!(schema["items"]["oneOf"].is_array());
+    // The declared schema is embedded verbatim with the description merged in
+    assert_eq!(schema["description"], "Attachments to send.");
+}
+
+#[test]
+fn scalar_definitions_unchanged_by_feature() {
+    // Definitions that don't use json params or cli overrides must produce
+    // byte-identical CLI output (the pre-feature generator).
+    let artifacts = generate_all(&sample_definition(), &GenerateConfig::default());
+    assert!(
+        artifacts
+            .cli_rs
+            .contains("#[arg(long)]\n    pub limit: Option<u32>,")
+    );
+    assert!(!artifacts.cli_rs.contains("ArgAction::Append"));
+    assert!(!artifacts.cli_rs.contains("long = \""));
+}
+
+#[test]
+fn cli_flag_override_without_multiple_keeps_scalar_shape() {
+    let mut definition = sample_definition();
+    definition.operations[0].parameters[0].cli = Some(hydra_core::CliOverride {
+        flag: Some("max-items".into()),
+        multiple: false,
+        companions: vec![],
+    });
+    let artifacts = generate_all(&definition, &GenerateConfig::default());
+    assert!(artifacts.cli_rs.contains("#[arg(long = \"max-items\")]"));
+    assert!(artifacts.cli_rs.contains("pub limit: Option<u32>,"));
+    // parameters_json keeps the wire name `limit`
+    assert!(artifacts.cli_rs.contains("\"limit\": args.limit.clone()"));
+}
+
+#[test]
+fn rejects_json_parameter_without_schema() {
+    let mut definition = definition_with_attachments();
+    let parameter = &mut definition.operations[0].parameters[1];
+    parameter.schema = None;
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+}
+
+#[test]
+fn rejects_json_parameter_on_non_body_location() {
+    let mut definition = definition_with_attachments();
+    let parameter = &mut definition.operations[0].parameters[1];
+    parameter.location = ParameterLocation::Query;
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+}
+
+#[test]
+fn rejects_schema_on_scalar_parameter() {
+    let mut definition = sample_definition();
+    definition.operations[0].parameters[0].schema = Some(serde_json::json!({"type": "integer"}));
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+}
+
+#[test]
+fn rejects_json_parameter_without_cli_block_on_cli_operation() {
+    let mut definition = definition_with_attachments();
+    definition.operations[0].parameters[1].cli = None;
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+    // ...but a json param is fine without cli on an operation that does not
+    // generate the CLI surface
+    definition.operations[0].surfaces =
+        Some(vec![hydra_core::Surface::Http, hydra_core::Surface::Mcp]);
+    assert!(hydra_core::validate::validate_definition(&definition).is_ok());
+}
+
+#[test]
+fn rejects_cli_block_on_non_cli_operation() {
+    let mut definition = definition_with_attachments();
+    definition.operations[0].surfaces =
+        Some(vec![hydra_core::Surface::Http, hydra_core::Surface::Mcp]);
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+}
+
+#[test]
+fn rejects_multiple_on_scalar_parameter() {
+    let mut definition = sample_definition();
+    definition.operations[0].parameters[0].cli = Some(hydra_core::CliOverride {
+        flag: None,
+        multiple: true,
+        companions: vec![],
+    });
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+}
+
+#[test]
+fn rejects_colliding_cli_flags() {
+    let mut definition = definition_with_attachments();
+    // The companion flag `attach-mime` collides with... nothing yet; make the
+    // parameter's own flag collide with the companion.
+    let parameter = &mut definition.operations[0].parameters[1];
+    parameter.cli = Some(hydra_core::CliOverride {
+        flag: Some("attach-mime".into()),
+        multiple: true,
+        companions: vec![hydra_core::CliCompanion {
+            flag: "attach-mime".into(),
+            field: "attach_mime".into(),
+            description: "Colliding companion.".into(),
+        }],
+    });
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+}
+
+#[test]
+fn rejects_non_kebab_flag_and_invalid_companion_field() {
+    let mut definition = definition_with_attachments();
+    let parameter = &mut definition.operations[0].parameters[1];
+    parameter.cli = Some(hydra_core::CliOverride {
+        flag: Some("Attach_Path".into()),
+        multiple: true,
+        companions: vec![],
+    });
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+
+    let mut definition = definition_with_attachments();
+    let parameter = &mut definition.operations[0].parameters[1];
+    parameter.cli = Some(hydra_core::CliOverride {
+        flag: None,
+        multiple: true,
+        companions: vec![hydra_core::CliCompanion {
+            flag: "attach-mime".into(),
+            field: "attach-mime".into(), // not snake_case
+            description: "Bad field.".into(),
+        }],
+    });
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
 }

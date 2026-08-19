@@ -77,3 +77,52 @@ operations:
     parameters: []
     surfaces: [http]
     raw_request: true
+  - name: annotate_note
+    description: Append an annotation to a note, optionally carrying attachments.
+    method: POST
+    path: /notes/{note_id}/annotate
+    read: false
+    output_type: Value
+    parameters:
+      - name: note_id
+        description: Note ID to annotate.
+        type: string
+        required: true
+        location: path
+      - name: body
+        description: Annotation text.
+        type: string
+        required: true
+        location: body
+      - name: attachments
+        description: Attachments to attach; each is inline bytes or a stored reference.
+        type: json
+        required: false
+        location: body
+        schema:
+          type: array
+          items:
+            oneOf:
+              - type: object
+                properties:
+                  mime_type:
+                    type: string
+                  filename:
+                    type: string
+                  data_base64:
+                    type: string
+                required: [mime_type, data_base64]
+                additionalProperties: false
+              - type: object
+                properties:
+                  stored_id:
+                    type: string
+                required: [stored_id]
+                additionalProperties: false
+        cli:
+          flag: attach
+          multiple: true
+          companions:
+            - flag: attach-mime
+              field: attach_mime
+              description: MIME type for the corresponding local-path --attach value.

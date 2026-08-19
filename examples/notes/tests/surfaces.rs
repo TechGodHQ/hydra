@@ -212,3 +212,163 @@ fn raw_request_route_absent_from_cli_and_mcp() {
     assert!(!cli_rs.contains("echo_raw") && !cli_rs.contains("EchoRaw"));
     assert!(!mcp_json.contains("echo_raw"));
 }
+
+// ── annotate_note: json parameters + CLI representation (COD-411) ──────────
+
+#[tokio::test]
+async fn annotate_note_accepts_valid_inline_and_stored_unions_over_http() {
+    let state = AppState::with_fixtures();
+    let res = http(
+        &state,
+        Request::post("/notes/n1/annotate")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&json!({
+                    "body": "see attachment",
+                    "attachments": [
+                        {"mime_type": "image/png", "filename": "a.png", "data_base64": "aGk="},
+                        {"stored_id": "11111111-1111-1111-1111-111111111111"}
+                    ]
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_json(res).await;
+    assert_eq!(
+        body["attachments"],
+        json!([
+            {"kind": "inline", "mime_type": "image/png"},
+            {"kind": "stored", "stored_id": "11111111-1111-1111-1111-111111111111"}
+        ])
+    );
+    assert!(
+        body["note"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("[annotation] see attachment")
+    );
+}
+
+#[tokio::test]
+async fn annotate_note_rejects_malformed_unions_with_400() {
+    let state = AppState::with_fixtures();
+    for bad in [
+        // mixed inline + stored
+        json!([{"mime_type": "image/png", "data_base64": "aGk=", "stored_id": "x"}]),
+        // inline missing data_base64
+        json!([{"mime_type": "image/png"}]),
+        // stored with extra field
+        json!([{"stored_id": "x", "filename": "y"}]),
+        // unknown field
+        json!([{"mime_type": "image/png", "data_base64": "aGk=", "url": "https://x"}]),
+        // neither variant
+        json!([{"filename": "only.png"}]),
+    ] {
+        let res = http(
+            &state,
+            Request::post("/notes/n1/annotate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&json!({"body": "b", "attachments": bad})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            res.status(),
+            StatusCode::BAD_REQUEST,
+            "union {bad} must 400"
+        );
+    }
+}
+
+#[tokio::test]
+async fn annotate_note_without_attachments_is_text_only() {
+    let state = AppState::with_fixtures();
+    let res = http(
+        &state,
+        Request::post("/notes/n1/annotate")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&json!({"body": "plain"})).unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_json(res).await;
+    assert_eq!(body["attachments"], json!([]));
+}
+
+#[test]
+fn generated_cli_parses_repeatable_attach_flags_into_wire_shape() {
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        command: notes_example::generated_cli::GeneratedCommand,
+    }
+
+    let cli = Cli::try_parse_from([
+        "notes",
+        "annotate-note",
+        "n1",
+        "--body",
+        "see attachments",
+        "--attach",
+        "/tmp/a.png",
+        "--attach",
+        "iris://attachment/11111111-1111-1111-1111-111111111111",
+        "--attach-mime",
+        "image/png",
+    ])
+    .expect("repeatable flags parse");
+    let notes_example::generated_cli::GeneratedCommand::AnnotateNote(args) = cli.command else {
+        panic!("expected annotate-note subcommand");
+    };
+    assert_eq!(
+        args.attachments,
+        Some(vec![
+            "/tmp/a.png".to_string(),
+            "iris://attachment/11111111-1111-1111-1111-111111111111".to_string(),
+        ])
+    );
+    assert_eq!(args.attach_mime, Some(vec!["image/png".to_string()]));
+    // parameters_json maps CLI shape back to the wire shape
+    let params =
+        notes_example::generated_cli::GeneratedCommand::AnnotateNote(args).parameters_json();
+    assert_eq!(
+        params["attachments"],
+        json!([
+            "/tmp/a.png",
+            "iris://attachment/11111111-1111-1111-1111-111111111111"
+        ])
+    );
+    assert_eq!(params["attach_mime"], json!(["image/png"]));
+    // body + note_id flow through unchanged
+    assert_eq!(params["body"], json!("see attachments"));
+    assert_eq!(params["note_id"], json!("n1"));
+}
+
+#[test]
+fn generated_mcp_tool_schema_carries_declared_union() {
+    let mcp: Value = serde_json::from_str(include_str!("../generated/mcp.json")).unwrap();
+    let tool = mcp["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == json!("annotate_note"))
+        .expect("annotate_note tool present");
+    let attachments = &tool["inputSchema"]["properties"]["attachments"];
+    assert_eq!(attachments["type"], json!("array"));
+    let one_of = attachments["items"]["oneOf"].as_array().unwrap();
+    assert_eq!(one_of.len(), 2);
+    assert_eq!(one_of[0]["required"], json!(["mime_type", "data_base64"]));
+    assert_eq!(one_of[1]["required"], json!(["stored_id"]));
+    assert_eq!(one_of[0]["additionalProperties"], json!(false));
+    assert_eq!(one_of[1]["additionalProperties"], json!(false));
+}

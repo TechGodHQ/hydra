@@ -156,6 +156,36 @@ pub async fn execute_operation(
             }
             Ok(Value::Null)
         }
+        "annotate_note" => {
+            #[derive(Deserialize)]
+            struct AnnotateArgs {
+                body: String,
+                #[serde(default)]
+                attachments: Value,
+            }
+            let args: AnnotateArgs = serde_json::from_value(input.body.clone())
+                .map_err(|e| bad_request(&format!("invalid body: {e}")))?;
+            let id = path_str(&input, "note_id")?;
+            let note = state
+                .notes
+                .lock()
+                .expect("notes lock")
+                .iter_mut()
+                .find(|n| n.id == id)
+                .map(|note| {
+                    note.body.push_str("\n[annotation] ");
+                    note.body.push_str(&args.body);
+                    note.clone()
+                })
+                .ok_or_else(|| not_found(&format!("note not found: {id}")))?;
+            // Echo the decoded attachment union back, content-free summary
+            // only — proving the wire shape survives all three surfaces.
+            let attachments = summarize_attachments(&args.attachments)?;
+            Ok(serde_json::json!({
+                "note": note,
+                "attachments": attachments,
+            }))
+        }
         "note_stats" => {
             let out_stats = {
                 let notes = state.notes.lock().expect("notes lock");
@@ -204,6 +234,55 @@ fn not_found(message: &str) -> OperationError {
         status: StatusCode::NOT_FOUND,
         message: message.to_string(),
     }
+}
+
+/// Validate the closed attachment union on the body and return a
+/// content-free summary: each item must be exactly inline
+/// (`mime_type` + `data_base64`, optional `filename`) or stored
+/// (`stored_id`); unknown or mixed fields are rejected.
+fn summarize_attachments(attachments: &Value) -> Result<Vec<Value>, OperationError> {
+    let Some(items) = attachments.as_array() else {
+        // Absent (null) or empty — no attachments to validate.
+        if attachments.is_null() {
+            return Ok(Vec::new());
+        }
+        return Err(bad_request("attachments must be an array"));
+    };
+    let mut summaries = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(object) = item.as_object() else {
+            return Err(bad_request("each attachment must be an object"));
+        };
+        let has_inline = object.contains_key("mime_type") || object.contains_key("data_base64");
+        let has_stored = object.contains_key("stored_id");
+        if has_stored && has_inline {
+            return Err(bad_request("attachment mixes inline and stored fields"));
+        }
+        let summary = if has_stored {
+            if object.len() != 1 {
+                return Err(bad_request("stored attachment must carry only stored_id"));
+            }
+            serde_json::json!({ "kind": "stored", "stored_id": object["stored_id"] })
+        } else if has_inline {
+            if !object.contains_key("mime_type") || !object.contains_key("data_base64") {
+                return Err(bad_request(
+                    "inline attachment requires mime_type and data_base64",
+                ));
+            }
+            for key in object.keys() {
+                if !matches!(key.as_str(), "mime_type" | "data_base64" | "filename") {
+                    return Err(bad_request(&format!(
+                        "unknown inline attachment field: {key}"
+                    )));
+                }
+            }
+            serde_json::json!({ "kind": "inline", "mime_type": object["mime_type"] })
+        } else {
+            return Err(bad_request("attachment must be inline or stored"));
+        };
+        summaries.push(summary);
+    }
+    Ok(summaries)
 }
 
 fn bad_request(message: &str) -> OperationError {
