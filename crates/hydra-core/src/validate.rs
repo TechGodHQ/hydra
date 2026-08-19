@@ -10,7 +10,7 @@ use anyhow::Result;
 
 use crate::{
     ApiDefinition, GENERATED_HTTP_RESERVED_NAMES, HttpMethod, Operation, ParameterLocation,
-    RUST_KEYWORDS, Surface,
+    ParameterType, RUST_KEYWORDS, Surface,
 };
 
 /// Validate semantic constraints that YAML parsing alone cannot enforce.
@@ -53,6 +53,7 @@ pub fn validate_definition(definition: &ApiDefinition) -> Result<()> {
         validate_operation_parameters(operation)?;
         validate_operation_surfaces(operation)?;
         validate_operation_raw_request(operation)?;
+        validate_operation_cli_overrides(operation)?;
     }
 
     // CLI command overrides must not collide with any generated subcommand.
@@ -121,6 +122,142 @@ fn validate_operation_parameters(operation: &Operation) -> Result<()> {
             operation.path
         );
     }
+    Ok(())
+}
+
+/// Validate json parameters, declared schemas, and CLI representation
+/// overrides for one operation. Everything is declared explicitly — this
+/// layer exists so a generated surface can never guess a parameter's CLI
+/// shape or MCP schema.
+fn validate_operation_cli_overrides(operation: &Operation) -> Result<()> {
+    // Collision namespaces across the whole operation: CLI struct field
+    // names and effective long flags. Every CLI-visible parameter and
+    // companion registers here — including parameters using the default
+    // CLI shape — so explicit overrides cannot collide with defaults.
+    let mut cli_fields: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut cli_flags: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    for parameter in &operation.parameters {
+        let label = format!("{}.{}", operation.name, parameter.name);
+        validate_parameter_schema(parameter, &label)?;
+
+        // CLI registration only matters when the CLI surface is generated.
+        if !operation.generates_cli() {
+            anyhow::ensure!(
+                parameter.cli.is_none(),
+                "parameter {label} declares a `cli` representation but operation {} \
+                 does not generate the CLI surface",
+                operation.name
+            );
+            continue;
+        }
+
+        if let Some(cli) = &parameter.cli {
+            anyhow::ensure!(
+                parameter.location != ParameterLocation::Path,
+                "parameter {label} declares a `cli` representation but is a path \
+                 parameter; path parameters are positional and keep their default \
+                 CLI shape"
+            );
+            if let Some(flag) = &cli.flag {
+                anyhow::ensure!(
+                    is_kebab_case(flag),
+                    "parameter {label} declares cli flag {flag:?} which is not kebab-case"
+                );
+            }
+            anyhow::ensure!(
+                !cli.multiple || parameter.ty == ParameterType::Json,
+                "parameter {label} declares cli multiple: true but is not type json; \
+                 repeatable flags are json-parameter-only"
+            );
+        } else {
+            // No CLI override: a json parameter would fall back to an
+            // inferred CLI shape (a single Value flag), which is forbidden.
+            anyhow::ensure!(
+                parameter.ty != ParameterType::Json,
+                "parameter {label} is type json on a CLI-generating operation \
+                 but declares no `cli` representation; the CLI shape must be \
+                 declared explicitly (flag/multiple/companions)"
+            );
+        }
+
+        // Register the parameter's CLI field name and, for non-positional
+        // parameters, its effective long flag (declared override or the
+        // kebab-case derivation clap applies to the field name).
+        anyhow::ensure!(
+            cli_fields.insert(parameter.name.clone()),
+            "operation {} declares colliding CLI fields: {}",
+            operation.name,
+            parameter.name
+        );
+        if parameter.location != ParameterLocation::Path {
+            let effective_flag = parameter
+                .cli
+                .as_ref()
+                .and_then(|cli| cli.flag.clone())
+                .unwrap_or_else(|| parameter.name.replace('_', "-"));
+            anyhow::ensure!(
+                cli_flags.insert(effective_flag.clone()),
+                "operation {} declares colliding CLI flags: {effective_flag}",
+                operation.name
+            );
+        }
+
+        if let Some(cli) = &parameter.cli {
+            for companion in &cli.companions {
+                anyhow::ensure!(
+                    is_kebab_case(&companion.flag),
+                    "parameter {label} companion declares flag {:?} which is not kebab-case",
+                    companion.flag
+                );
+                anyhow::ensure!(
+                    crate::validate::is_valid_identifier(&companion.field),
+                    "parameter {label} companion declares field {:?} which is not a \
+                     Rust-safe snake_case identifier",
+                    companion.field
+                );
+                anyhow::ensure!(
+                    cli_flags.insert(companion.flag.clone()),
+                    "operation {} declares colliding CLI flags: {}",
+                    operation.name,
+                    companion.flag
+                );
+                anyhow::ensure!(
+                    cli_fields.insert(companion.field.clone()),
+                    "operation {} declares colliding CLI fields: {} (companion field)",
+                    operation.name,
+                    companion.field
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate the json/schema pairing for one parameter: json parameters
+/// are body-only and must declare an object schema; schemas are
+/// json-parameter-only.
+fn validate_parameter_schema(parameter: &crate::Parameter, label: &str) -> Result<()> {
+    if parameter.ty == ParameterType::Json {
+        anyhow::ensure!(
+            parameter.location == ParameterLocation::Body,
+            "parameter {label} is type json but not located in the body; \
+             json parameters are body-only"
+        );
+        anyhow::ensure!(
+            parameter
+                .schema
+                .as_ref()
+                .is_some_and(serde_json::Value::is_object),
+            "parameter {label} is type json but declares no object `schema`; \
+             json parameters must declare their JSON Schema explicitly"
+        );
+    }
+    anyhow::ensure!(
+        parameter.ty == ParameterType::Json || parameter.schema.is_none(),
+        "parameter {label} declares a `schema` but is not type json; \
+         schemas are json-parameter-only"
+    );
     Ok(())
 }
 

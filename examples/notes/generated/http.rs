@@ -45,6 +45,7 @@ pub const GENERATED_ROUTES: &[GeneratedRoute] = &[
     GeneratedRoute { name: "delete_note", method: "POST", path: "/notes/{note_id}/delete" },
     GeneratedRoute { name: "note_stats", method: "GET", path: "/stats" },
     GeneratedRoute { name: "echo_raw", method: "POST", path: "/hooks/echo" },
+    GeneratedRoute { name: "annotate_note", method: "POST", path: "/notes/{note_id}/annotate" },
 ];
 
 pub fn generated_router() -> Router<crate::AppState> {
@@ -55,6 +56,7 @@ pub fn generated_router() -> Router<crate::AppState> {
         .route("/notes/{note_id}/delete", post(delete_note))
         .route("/stats", get(note_stats))
         .route("/hooks/echo", post(echo_raw))
+        .route("/notes/{note_id}/annotate", post(annotate_note))
 }
 
 async fn list_notes(
@@ -158,6 +160,23 @@ async fn echo_raw(
             query: BTreeMap::new(),
             headers,
             raw_body: raw_body.to_vec(),
+        },
+    )
+    .await
+}
+
+async fn annotate_note(
+    State(state): State<crate::AppState>,
+    Path(path): Path<BTreeMap<String, String>>,
+    Json(body): Json<Value>,
+) -> Response {
+    crate::execute_operation_http(
+        &state,
+        "annotate_note",
+        GeneratedOperationInput {
+            path,
+            query: BTreeMap::new(),
+            body,
         },
     )
     .await

@@ -201,6 +201,60 @@ pub struct Parameter {
     pub required: bool,
     /// Where this parameter appears in HTTP requests.
     pub location: ParameterLocation,
+    /// JSON Schema describing the wire shape of a `json` parameter.
+    ///
+    /// Declared explicitly — never inferred — and embedded verbatim (plus
+    /// the parameter description) into generated MCP tool input schemas.
+    /// Required for `json` parameters, forbidden for scalar ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
+    /// Explicit CLI representation override. Declared — never inferred —
+    /// for parameters whose CLI shape differs from the default single
+    /// `--name` flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli: Option<CliOverride>,
+}
+
+/// Explicit CLI representation for a parameter.
+///
+/// The default CLI shape is one `--name` flag bound to the parameter.
+/// When that is wrong (repeatable flags, companion flags that only make
+/// sense on the CLI), the definition declares it here. Everything is
+/// explicit: flag names, field names, and descriptions.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CliOverride {
+    /// Kebab-case flag name override. Defaults to the parameter name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flag: Option<String>,
+    /// Repeatable flag → `Vec<String>` clap field. `json` parameters only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multiple: bool,
+    /// Additional CLI-only repeatable string flags (e.g. `--attach-mime`).
+    /// Emitted as `Option<Vec<String>>` clap fields; never part of the
+    /// HTTP or MCP surface.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub companions: Vec<CliCompanion>,
+}
+
+/// A CLI-only companion flag paired with a parameter's own CLI flags.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CliCompanion {
+    /// Kebab-case flag name, e.g. `attach-mime`.
+    pub flag: String,
+    /// Stable `snake_case` struct field name, e.g. `attach_mime`.
+    pub field: String,
+    /// Human-readable description for CLI help.
+    pub description: String,
+}
+
+impl CliOverride {
+    /// Effective flag name: the declared override or the parameter name.
+    #[must_use]
+    pub fn effective_flag(&self, parameter_name: &str) -> String {
+        self.flag
+            .clone()
+            .unwrap_or_else(|| parameter_name.to_owned())
+    }
 }
 
 /// Parameter type supported by the first-generation codegen contract.
@@ -213,6 +267,12 @@ pub enum ParameterType {
     U32,
     /// Boolean flag.
     Bool,
+    /// Arbitrary JSON value on the body location. Requires a declared
+    /// `schema`, which flows into generated MCP tool input schemas; the
+    /// HTTP body already arrives as an untyped JSON value, so the
+    /// runtime owns validation. `json` parameters on CLI-generating
+    /// operations must declare a `cli:` representation override.
+    Json,
 }
 
 impl ParameterType {
@@ -223,6 +283,7 @@ impl ParameterType {
             Self::String => "String",
             Self::U32 => "u32",
             Self::Bool => "bool",
+            Self::Json => "serde_json::Value",
         }
     }
 
@@ -233,6 +294,7 @@ impl ParameterType {
             Self::String => "string",
             Self::U32 => "integer",
             Self::Bool => "boolean",
+            Self::Json => "object",
         }
     }
 }

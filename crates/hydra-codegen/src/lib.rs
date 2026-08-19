@@ -164,12 +164,7 @@ fn generate_cli(definition: &ApiDefinition) -> String {
             if index > 0 {
                 out.push_str(", ");
             }
-            out.push_str(&rust_string_literal(&parameter.name));
-            out.push_str(": args.");
-            out.push_str(&parameter.name);
-            if matches!(parameter.ty, hydra_core::ParameterType::String) || !parameter.required {
-                out.push_str(".clone()");
-            }
+            push_parameters_json_entry(&mut out, parameter);
         }
         out.push_str("}),\n");
     }
@@ -184,20 +179,29 @@ fn generate_cli(definition: &ApiDefinition) -> String {
         out.push_str("Args {\n");
         for parameter in &operation.parameters {
             push_doc_comment(&mut out, "    ", &parameter.description);
-            if parameter.location != ParameterLocation::Path {
-                out.push_str("    #[arg(long)]\n");
+            emit_cli_field(
+                &mut out,
+                &parameter.name,
+                parameter.ty.rust_type(),
+                parameter.location == ParameterLocation::Path,
+                parameter.required,
+                parameter.cli.as_ref(),
+                None,
+            );
+            if let Some(cli) = &parameter.cli {
+                for companion in &cli.companions {
+                    push_doc_comment(&mut out, "    ", &companion.description);
+                    emit_cli_field(
+                        &mut out,
+                        &companion.field,
+                        "String",
+                        false,
+                        false,
+                        None,
+                        Some(&companion.flag),
+                    );
+                }
             }
-            out.push_str("    pub ");
-            out.push_str(&parameter.name);
-            out.push_str(": ");
-            if parameter.required {
-                out.push_str(parameter.ty.rust_type());
-            } else {
-                out.push_str("Option<");
-                out.push_str(parameter.ty.rust_type());
-                out.push('>');
-            }
-            out.push_str(",\n");
         }
         out.push_str("}\n\n");
     }
@@ -205,8 +209,97 @@ fn generate_cli(definition: &ApiDefinition) -> String {
     out
 }
 
+/// Emit one clap field for a generated CLI args struct.
+///
+/// Path-location parameters stay positional (no attribute), preserving
+/// the pre-existing contract. Companion fields are always optional
+/// repeatable strings with an explicitly declared flag name. Parameter
+/// fields with a CLI representation override follow it: an explicit flag
+/// name when declared, and `multiple` → `Option<Vec<String>>` with
+/// `ArgAction::Append`. When no flag is declared, clap derives the long
+/// flag from the field name (`snake_case` → kebab-case).
+fn emit_cli_field(
+    out: &mut String,
+    field: &str,
+    rust_type: &str,
+    positional: bool,
+    required: bool,
+    cli: Option<&hydra_core::CliOverride>,
+    companion_flag: Option<&str>,
+) {
+    let mut field_type = if required && companion_flag.is_none() && !cli.is_some_and(|c| c.multiple)
+    {
+        rust_type.to_owned()
+    } else {
+        format!("Option<{rust_type}>")
+    };
+    let attribute = if let Some(flag) = companion_flag {
+        field_type = "Option<Vec<String>>".to_string();
+        format!("    #[arg(long = \"{flag}\", action = clap::ArgAction::Append)]\n")
+    } else if let Some(cli) = cli {
+        if cli.multiple {
+            field_type = "Option<Vec<String>>".to_string();
+            format!(
+                "    #[arg(long = \"{}\", action = clap::ArgAction::Append, required = {required})]\n",
+                cli.effective_flag(field)
+            )
+        } else if let Some(flag) = &cli.flag {
+            // An explicitly declared flag name is emitted verbatim.
+            format!("    #[arg(long = \"{flag}\")]\n")
+        } else {
+            "    #[arg(long)]\n".to_owned()
+        }
+    } else if positional {
+        String::new()
+    } else {
+        "    #[arg(long)]\n".to_owned()
+    };
+    out.push_str(&attribute);
+    out.push_str("    pub ");
+    out.push_str(field);
+    out.push_str(": ");
+    out.push_str(&field_type);
+    out.push_str(",\n");
+}
+
 fn cli_operations(definition: &ApiDefinition) -> impl Iterator<Item = &Operation> {
     definition.operations.iter().filter(|o| o.generates_cli())
+}
+
+/// Emit one `"wire_name": args.field` entry of a generated
+/// `parameters_json()` match arm.
+///
+/// CLI representation overrides transform the CLI input back into the
+/// wire shape: repeatable flags become arrays (defaulting to empty),
+/// companions ride alongside as sibling keys.
+fn push_parameters_json_entry(out: &mut String, parameter: &Parameter) {
+    out.push_str(&rust_string_literal(&parameter.name));
+    out.push_str(": ");
+    out.push_str("args.");
+    out.push_str(&parameter.name);
+    match &parameter.cli {
+        Some(cli) => {
+            if cli.multiple {
+                // `required = true` multiple flags are enforced by clap at
+                // parse time; unwrap_or_default() covers the optional case.
+                out.push_str(".clone().unwrap_or_default()");
+            } else {
+                out.push_str(".clone()");
+            }
+            for companion in &cli.companions {
+                out.push_str(", ");
+                out.push_str(&rust_string_literal(&companion.field));
+                out.push_str(": args.");
+                out.push_str(&companion.field);
+                out.push_str(".clone()");
+            }
+        }
+        None => {
+            if matches!(parameter.ty, hydra_core::ParameterType::String) || !parameter.required {
+                out.push_str(".clone()");
+            }
+        }
+    }
 }
 
 // ── HTTP surface ───────────────────────────────────────────────────────────
@@ -577,13 +670,29 @@ fn generate_mcp(definition: &ApiDefinition) -> String {
                 if parameter.required {
                     required.push(parameter.name.clone());
                 }
-                properties.insert(
-                    parameter.name.clone(),
+                let property = if parameter.ty == hydra_core::ParameterType::Json {
+                    // Declared JSON Schema subtree, verbatim. The parameter
+                    // description is merged in only when the subtree does
+                    // not carry its own `description` — a schema-level
+                    // description wins, preserving verbatim embedding as
+                    // the primary contract.
+                    let mut subtree = parameter
+                        .schema
+                        .clone()
+                        .unwrap_or_else(|| json!({"type": "object"}));
+                    if let Some(object) = subtree.as_object_mut() {
+                        object
+                            .entry("description".to_owned())
+                            .or_insert_with(|| json!(parameter.description));
+                    }
+                    subtree
+                } else {
                     json!({
                         "type": parameter.ty.json_schema_type(),
                         "description": parameter.description,
-                    }),
-                );
+                    })
+                };
+                properties.insert(parameter.name.clone(), property);
             }
             json!({
                 "name": operation.name,

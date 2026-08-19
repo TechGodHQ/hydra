@@ -16,6 +16,8 @@ pub enum GeneratedCommand {
     DeleteNote(DeleteNoteArgs),
     /// Internal compaction job; exposed on CLI only for operators.
     CompactNotes(CompactNotesArgs),
+    /// Append an annotation to a note, optionally carrying attachments.
+    AnnotateNote(AnnotateNoteArgs),
 }
 
 impl GeneratedCommand {
@@ -26,6 +28,7 @@ impl GeneratedCommand {
             Self::CreateNote(_) => "create_note",
             Self::DeleteNote(_) => "delete_note",
             Self::CompactNotes(_) => "compact_notes",
+            Self::AnnotateNote(_) => "annotate_note",
         }
     }
 
@@ -36,6 +39,7 @@ impl GeneratedCommand {
             Self::CreateNote(args) => serde_json::json!({"title": args.title.clone(), "body": args.body.clone()}),
             Self::DeleteNote(args) => serde_json::json!({"note_id": args.note_id.clone()}),
             Self::CompactNotes(_args) => serde_json::json!({}),
+            Self::AnnotateNote(args) => serde_json::json!({"note_id": args.note_id.clone(), "body": args.body.clone(), "attachments": args.attachments.clone().unwrap_or_default(), "attach_mime": args.attach_mime.clone()}),
         }
     }
 }
@@ -71,5 +75,20 @@ pub struct DeleteNoteArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Args)]
 pub struct CompactNotesArgs {
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Args)]
+pub struct AnnotateNoteArgs {
+    /// Note ID to annotate.
+    pub note_id: String,
+    /// Annotation text.
+    #[arg(long)]
+    pub body: String,
+    /// Attachments to attach; each is inline bytes or a stored reference.
+    #[arg(long = "attach", action = clap::ArgAction::Append, required = false)]
+    pub attachments: Option<Vec<String>>,
+    /// MIME type for the corresponding local-path --attach value.
+    #[arg(long = "attach-mime", action = clap::ArgAction::Append)]
+    pub attach_mime: Option<Vec<String>>,
 }
 
