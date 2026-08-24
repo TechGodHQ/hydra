@@ -372,3 +372,91 @@ fn generated_mcp_tool_schema_carries_declared_union() {
     assert_eq!(one_of[0]["additionalProperties"], json!(false));
     assert_eq!(one_of[1]["additionalProperties"], json!(false));
 }
+
+// ── ingest_batch: source-agnostic JSON batch operation (COD-443) ───────────
+
+#[tokio::test]
+async fn ingest_batch_uses_one_declared_contract_over_http_and_dispatch() {
+    let state = AppState::with_fixtures();
+    let batch: Value = serde_json::from_str(include_str!("fixtures/ingest-batch.json"))
+        .expect("ingest batch fixture is valid JSON");
+
+    let direct = via_dispatch(&state, "ingest_batch", json!({"body": batch})).await;
+    let res = http(
+        &state,
+        Request::post("/ingest/batches")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&batch).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_json(res).await, direct);
+    assert_eq!(direct["accepted"], json!(2));
+}
+
+#[tokio::test]
+async fn generated_cli_and_mcp_expose_the_batch_contract() {
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        command: notes_example::generated_cli::GeneratedCommand,
+    }
+    let cli = Cli::try_parse_from([
+        "notes",
+        "ingest-batch",
+        "--replay-key",
+        "herdr:cursor:42",
+        "--batch-hash",
+        "sha256:fixture",
+        "--event",
+        r#"{"type":"workspace_created"}"#,
+        "--event",
+        r#"{"type":"pane_agent_status_changed"}"#,
+    ])
+    .expect("batch flags parse");
+    let notes_example::generated_cli::GeneratedCommand::IngestBatch(args) = cli.command else {
+        panic!("expected ingest-batch subcommand");
+    };
+    let parameters =
+        notes_example::generated_cli::GeneratedCommand::IngestBatch(args).parameters_json();
+    assert_eq!(parameters["events"].as_array().unwrap().len(), 2);
+
+    // The CLI representation is explicitly repeated JSON strings, so prove
+    // the one consumer dispatch normalizes it before applying the operation.
+    let state = AppState::with_fixtures();
+    let receipt = execute_operation(
+        &state,
+        "ingest_batch",
+        GeneratedOperationInput {
+            path: std::collections::BTreeMap::new(),
+            query: std::collections::BTreeMap::new(),
+            body: parameters,
+        },
+    )
+    .await
+    .expect("CLI batch dispatch succeeds");
+    assert_eq!(receipt["accepted"], json!(2));
+
+    let mcp: Value = serde_json::from_str(include_str!("../generated/mcp.json")).unwrap();
+    let tool = mcp["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == json!("ingest_batch"))
+        .expect("ingest_batch tool present");
+    assert_eq!(
+        tool["inputSchema"]["properties"]["events"]["type"],
+        json!("array")
+    );
+    assert_eq!(
+        tool["inputSchema"]["properties"]["events"]["minItems"],
+        json!(1)
+    );
+    assert_eq!(
+        tool["inputSchema"]["required"],
+        json!(["replay_key", "batch_hash", "events"])
+    );
+}

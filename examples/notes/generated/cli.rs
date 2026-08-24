@@ -18,6 +18,8 @@ pub enum GeneratedCommand {
     CompactNotes(CompactNotesArgs),
     /// Append an annotation to a note, optionally carrying attachments.
     AnnotateNote(AnnotateNoteArgs),
+    /// Accept a source-agnostic, replayable batch of JSON events through every generated surface.
+    IngestBatch(IngestBatchArgs),
 }
 
 impl GeneratedCommand {
@@ -29,6 +31,7 @@ impl GeneratedCommand {
             Self::DeleteNote(_) => "delete_note",
             Self::CompactNotes(_) => "compact_notes",
             Self::AnnotateNote(_) => "annotate_note",
+            Self::IngestBatch(_) => "ingest_batch",
         }
     }
 
@@ -40,6 +43,7 @@ impl GeneratedCommand {
             Self::DeleteNote(args) => serde_json::json!({"note_id": args.note_id.clone()}),
             Self::CompactNotes(_args) => serde_json::json!({}),
             Self::AnnotateNote(args) => serde_json::json!({"note_id": args.note_id.clone(), "body": args.body.clone(), "attachments": args.attachments.clone().unwrap_or_default(), "attach_mime": args.attach_mime.clone()}),
+            Self::IngestBatch(args) => serde_json::json!({"replay_key": args.replay_key.clone(), "batch_hash": args.batch_hash.clone(), "events": args.events.clone().unwrap_or_default()}),
         }
     }
 }
@@ -90,5 +94,18 @@ pub struct AnnotateNoteArgs {
     /// MIME type for the corresponding local-path --attach value.
     #[arg(long = "attach-mime", action = clap::ArgAction::Append)]
     pub attach_mime: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Args)]
+pub struct IngestBatchArgs {
+    /// Stable source replay key used by the consumer for idempotency.
+    #[arg(long)]
+    pub replay_key: String,
+    /// Content hash for replay-conflict detection, computed by the consumer.
+    #[arg(long)]
+    pub batch_hash: String,
+    /// Ordered source events in the batch.
+    #[arg(long = "event", action = clap::ArgAction::Append, required = true)]
+    pub events: Option<Vec<String>>,
 }
 

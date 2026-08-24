@@ -1,0 +1,14 @@
+{
+  "replay_key": "herdr:cursor:42",
+  "batch_hash": "sha256:fixture",
+  "events": [
+    {
+      "type": "workspace_created",
+      "workspace": "iris"
+    },
+    {
+      "type": "pane_agent_status_changed",
+      "status": "working"
+    }
+  ]
+}
