@@ -77,6 +77,48 @@ cargo run -p hydra-codegen -- check   # CI guard: fails if artifacts are stale
 4. `include!` the generated files, implement one dispatch function, and wire
    your binaries. See `examples/notes/src/lib.rs`.
 
+### JSON batch operations
+
+Hydra v0.2.0 can project a declared `json` body parameter to HTTP, MCP, and
+CLI. Declare the JSON Schema explicitly; Hydra embeds it in the MCP input
+schema and generates the HTTP route from the same operation. For a batch that
+needs a shell-friendly CLI representation, declare the representation rather
+than inferring one:
+
+```yaml
+- name: ingest_batch
+  description: Apply an ordered, replayable source batch.
+  method: POST
+  path: /ingest/batches
+  read: false
+  output_type: IngestReceipt
+  parameters:
+    - name: replay_key
+      description: Stable idempotency key.
+      type: string
+      required: true
+      location: body
+    - name: events
+      description: Ordered source events.
+      type: json
+      required: true
+      location: body
+      schema:
+        type: array
+        minItems: 1
+        items: { type: object }
+      cli:
+        flag: event
+        multiple: true
+```
+
+HTTP and MCP callers pass `events` as the declared JSON array. The generated
+CLI accepts repeated `--event '<json object>'` flags; the consumer's single
+dispatch function parses that explicit CLI representation before typed
+validation and persistence. Hydra does not own source-specific event models,
+batch hashing, idempotency, or transactions. `examples/notes` contains a
+tested `ingest_batch` reference operation and is the pattern Iris should use.
+
 ## Raw-request (webhook) operations
 
 Operations that must see the exact wire representation — signature-verified

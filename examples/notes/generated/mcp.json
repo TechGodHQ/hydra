@@ -15,6 +15,11 @@
     "get_note": {
       "note_id": "path"
     },
+    "ingest_batch": {
+      "batch_hash": "body",
+      "events": "body",
+      "replay_key": "body"
+    },
     "list_notes": {
       "limit": "query"
     },
@@ -162,6 +167,37 @@
         "type": "object"
       },
       "name": "annotate_note"
+    },
+    {
+      "description": "Accept a source-agnostic, replayable batch of JSON events through every generated surface.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "batch_hash": {
+            "description": "Content hash for replay-conflict detection, computed by the consumer.",
+            "type": "string"
+          },
+          "events": {
+            "description": "Ordered source events in the batch.",
+            "items": {
+              "type": "object"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "replay_key": {
+            "description": "Stable source replay key used by the consumer for idempotency.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "replay_key",
+          "batch_hash",
+          "events"
+        ],
+        "type": "object"
+      },
+      "name": "ingest_batch"
     }
   ]
 }

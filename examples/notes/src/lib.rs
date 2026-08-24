@@ -186,6 +186,7 @@ pub async fn execute_operation(
                 "attachments": attachments,
             }))
         }
+        "ingest_batch" => execute_ingest_batch(input.body),
         "note_stats" => {
             let out_stats = {
                 let notes = state.notes.lock().expect("notes lock");
@@ -283,6 +284,53 @@ fn summarize_attachments(attachments: &Value) -> Result<Vec<Value>, OperationErr
         summaries.push(summary);
     }
     Ok(summaries)
+}
+
+/// Apply the reference batch contract after every generated surface reaches
+/// this single dispatch function. Persistence and idempotency stay consumer-owned.
+fn execute_ingest_batch(body: Value) -> Result<Value, OperationError> {
+    #[derive(Deserialize)]
+    struct IngestArgs {
+        replay_key: String,
+        batch_hash: String,
+        events: Value,
+    }
+    let args: IngestArgs = serde_json::from_value(body)
+        .map_err(|e| bad_request(&format!("invalid batch body: {e}")))?;
+    if args.replay_key.trim().is_empty() || args.batch_hash.trim().is_empty() {
+        return Err(bad_request("replay_key and batch_hash must not be blank"));
+    }
+    let events = normalize_batch_events(&args.events)?;
+    Ok(serde_json::json!({
+        "accepted": events.len(),
+        "replay_key": args.replay_key,
+        "batch_hash": args.batch_hash,
+    }))
+}
+
+/// Normalize repeated CLI `--event <json>` values to the ordered JSON objects
+/// HTTP and MCP callers pass directly in the declared batch field.
+fn normalize_batch_events(events: &Value) -> Result<Vec<Value>, OperationError> {
+    let Some(events) = events.as_array() else {
+        return Err(bad_request("events must be a non-empty array"));
+    };
+    if events.is_empty() {
+        return Err(bad_request("events must be a non-empty array"));
+    }
+
+    let mut normalized = Vec::with_capacity(events.len());
+    for event in events {
+        let event = match event {
+            Value::String(raw) => serde_json::from_str(raw)
+                .map_err(|e| bad_request(&format!("--event must be JSON: {e}")))?,
+            event => event.clone(),
+        };
+        if !event.is_object() {
+            return Err(bad_request("each event must be a JSON object"));
+        }
+        normalized.push(event);
+    }
+    Ok(normalized)
 }
 
 fn bad_request(message: &str) -> OperationError {

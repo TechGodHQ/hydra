@@ -126,3 +126,33 @@ operations:
             - flag: attach-mime
               field: attach_mime
               description: MIME type for the corresponding local-path --attach value.
+  - name: ingest_batch
+    description: Accept a source-agnostic, replayable batch of JSON events through every generated surface.
+    method: POST
+    path: /ingest/batches
+    read: false
+    output_type: IngestReceipt
+    parameters:
+      - name: replay_key
+        description: Stable source replay key used by the consumer for idempotency.
+        type: string
+        required: true
+        location: body
+      - name: batch_hash
+        description: Content hash for replay-conflict detection, computed by the consumer.
+        type: string
+        required: true
+        location: body
+      - name: events
+        description: Ordered source events in the batch.
+        type: json
+        required: true
+        location: body
+        schema:
+          type: array
+          minItems: 1
+          items:
+            type: object
+        cli:
+          flag: event
+          multiple: true
