@@ -5,6 +5,7 @@ members = [
     "crates/hydra-mcp-stdio",
     "crates/hydra-codegen",
     "examples/notes",
+    "examples/security-scan",
 ]
 
 [workspace.package]

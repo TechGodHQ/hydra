@@ -33,7 +33,9 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check example generated artifacts
-        run: cd examples/notes && cargo run -p hydra-codegen --bin hydra-codegen -- check
+        run: |
+          cd examples/notes && cargo run -p hydra-codegen --bin hydra-codegen -- check
+          cd ../security-scan && cargo run -p hydra-codegen --bin hydra-codegen -- check
 
   creed:
     name: Creed context drift
