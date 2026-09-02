@@ -1,0 +1,19 @@
+operations:
+  - name: run_security_scan
+    description: Run the configured security scanner against an allowed target.
+    method: POST
+    path: /security/scans
+    read: false
+    output_type: SecurityScanResult
+    surfaces: [cli, http, mcp]
+    parameters:
+      - name: target
+        description: Closed target identifier accepted by this tracer bullet.
+        type: string
+        required: true
+        location: body
+      - name: profile
+        description: Explicit scanner profile; omission selects baseline.
+        type: string
+        required: false
+        location: body

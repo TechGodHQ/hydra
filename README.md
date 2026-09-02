@@ -119,6 +119,23 @@ validation and persistence. Hydra does not own source-specific event models,
 batch hashing, idempotency, or transactions. `examples/notes` contains a
 tested `ingest_batch` reference operation and is the pattern Iris should use.
 
+### Security-scanner consumer boundary
+
+`examples/security-scan` is a deliberately small, fixture-backed consumer
+reference. Its explicit `run_security_scan` operation projects to CLI, HTTP,
+and MCP, while the consumer—not Hydra—owns a typed `SecurityScanner` trait and
+the single dispatch function. The checked-in fixture only accepts
+`fixture:demo-repo` and the optional `baseline` profile. It never treats input
+as a command, filesystem path, or URL.
+
+The fixture needs no configuration. A future live adapter must read only
+`DEEPSEC_ENDPOINT` (an absolute HTTPS URL) and `DEEPSEC_TOKEN` (a non-empty
+credential) from its environment. Neither belongs in source, generated output,
+logs, requests, or public errors. Consumer adapters must map private failures
+to the fixed public `invalid_request`, `scanner_unavailable`, or `scan_failed`
+error codes without serializing vendor details, credentials, headers, endpoints,
+or raw scanner output.
+
 ## Raw-request (webhook) operations
 
 Operations that must see the exact wire representation — signature-verified

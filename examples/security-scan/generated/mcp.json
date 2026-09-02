@@ -1,0 +1,31 @@
+{
+  "locations": {
+    "run_security_scan": {
+      "profile": "body",
+      "target": "body"
+    }
+  },
+  "tools": [
+    {
+      "description": "Run the configured security scanner against an allowed target.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "profile": {
+            "description": "Explicit scanner profile; omission selects baseline.",
+            "type": "string"
+          },
+          "target": {
+            "description": "Closed target identifier accepted by this tracer bullet.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target"
+        ],
+        "type": "object"
+      },
+      "name": "run_security_scan"
+    }
+  ]
+}
