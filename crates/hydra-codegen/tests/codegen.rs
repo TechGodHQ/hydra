@@ -5,6 +5,50 @@ use hydra_codegen::{GenerateConfig, generate_all};
 use hydra_core::{ApiDefinition, Delivery, HttpMethod, Operation, Parameter, ParameterLocation};
 use pretty_assertions::assert_eq;
 
+fn context_page_definition() -> ApiDefinition {
+    // Pagination retention/replay and the concrete `ContextPage.next_cursor`
+    // value are consumer-owned. Hydra only projects this explicit unary
+    // operation and preserves its dispatch result without domain semantics.
+    ApiDefinition {
+        operations: vec![Operation {
+            name: "get_context_page".into(),
+            description: "Read one cursor-paginated context page.".into(),
+            method: HttpMethod::Get,
+            path: "/v1/context".into(),
+            read: true,
+            output_type: "ContextPage".into(),
+            parameters: vec![
+                Parameter {
+                    name: "limit".into(),
+                    description: "Maximum records to return.".into(),
+                    ty: hydra_core::ParameterType::U32,
+                    required: false,
+                    location: ParameterLocation::Query,
+                    schema: None,
+                    cli: None,
+                },
+                Parameter {
+                    name: "cursor".into(),
+                    description: "Opaque cursor from ContextPage.next_cursor.".into(),
+                    ty: hydra_core::ParameterType::String,
+                    required: false,
+                    location: ParameterLocation::Query,
+                    schema: None,
+                    cli: None,
+                },
+            ],
+            delivery: Delivery::Unary,
+            surfaces: Some(vec![
+                hydra_core::Surface::Cli,
+                hydra_core::Surface::Http,
+                hydra_core::Surface::Mcp,
+            ]),
+            cli_command: None,
+            raw_request: false,
+        }],
+    }
+}
+
 fn sample_definition() -> ApiDefinition {
     ApiDefinition {
         operations: vec![Operation {
@@ -121,6 +165,57 @@ fn mcp_locations_metadata_is_emitted() {
     let parsed: serde_json::Value = serde_json::from_str(&artifacts.mcp_json).unwrap();
     assert_eq!(
         parsed["locations"]["list_items"]["limit"],
+        serde_json::json!("query")
+    );
+}
+
+#[test]
+fn unary_cursor_pagination_projects_deterministically_across_surfaces() {
+    let definition = context_page_definition();
+    assert!(hydra_core::validate::validate_definition(&definition).is_ok());
+
+    let first = generate_all(&definition, &GenerateConfig::default());
+    let second = generate_all(&definition, &GenerateConfig::default());
+    assert_eq!(first.cli_rs, second.cli_rs);
+    assert_eq!(first.http_rs, second.http_rs);
+    assert_eq!(first.mcp_json, second.mcp_json);
+
+    assert!(first.cli_rs.contains("GetContextPage(GetContextPageArgs)"));
+    assert!(first.cli_rs.contains("pub limit: Option<u32>"));
+    assert!(first.cli_rs.contains("pub cursor: Option<String>"));
+    assert!(
+        first
+            .http_rs
+            .contains(".route(\"/v1/context\", get(get_context_page))")
+    );
+    assert!(
+        first
+            .http_rs
+            .contains("Query(query): Query<BTreeMap<String, String>>")
+    );
+    assert!(first.http_rs.contains(
+        "GeneratedOperationInput {\n            path: BTreeMap::new(),\n            query,"
+    ));
+
+    let mcp: serde_json::Value = serde_json::from_str(&first.mcp_json).unwrap();
+    assert_eq!(
+        mcp["tools"][0]["name"],
+        serde_json::json!("get_context_page")
+    );
+    assert_eq!(
+        mcp["tools"][0]["inputSchema"]["properties"]["limit"]["type"],
+        serde_json::json!("integer")
+    );
+    assert_eq!(
+        mcp["tools"][0]["inputSchema"]["properties"]["cursor"]["type"],
+        serde_json::json!("string")
+    );
+    assert_eq!(
+        mcp["locations"]["get_context_page"]["limit"],
+        serde_json::json!("query")
+    );
+    assert_eq!(
+        mcp["locations"]["get_context_page"]["cursor"],
         serde_json::json!("query")
     );
 }
