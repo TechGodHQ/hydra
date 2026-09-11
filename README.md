@@ -177,6 +177,29 @@ existed.
 - **Selective projection** via `surfaces: [http, mcp]` allowlists, with CLI
   command renames (`cli_command:`) when the public name should differ.
 
+## Releases & versioning
+
+**Status: v0.2.2 is proposed, not published.** The workspace manifests have been
+aligned to `0.2.2` in preparation; no tag, GitHub release, or crates.io
+publication exists yet. A separate task will publish it.
+
+- **Historical tags are immutable.** Tags `v0.1.0` … `v0.2.1` were cut from
+  commits whose workspace manifests still said `0.1.0`; they are reproducible
+  git pins and will never be moved or rewritten. From v0.2.2 onward the
+  manifest version will agree with the tag at the moment of tagging.
+- **What v0.2.2 covers:** merged PRs [#6](https://github.com/TechGodHQ/hydra/pull/6)
+  (DeepSec tracer example), [#7](https://github.com/TechGodHQ/hydra/pull/7)
+  (layered agent context), and [#8](https://github.com/TechGodHQ/hydra/pull/8)
+  (unary cursor pagination fixture) — release metadata, reference coverage,
+  and documentation/context changes. No production changes under `crates/*/src`.
+- **Consumers pin git tags, not crates.io.** hydra is not published to
+  crates.io. Consumers pin a tag and regenerate:
+  `hydra-core = { git = "https://github.com/TechGodHQ/hydra", tag = "v0.2.2" }`
+  (same shape for `hydra-codegen`), then re-run
+  `cargo run -p hydra-codegen -- write` in their own repo and commit the
+  regenerated surfaces. Tag-pin examples become valid **only after the
+  v0.2.2 tag is actually published** — until then pin `v0.2.1`.
+
 ## License
 
 MIT.

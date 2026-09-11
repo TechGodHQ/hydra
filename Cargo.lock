@@ -320,7 +320,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "hydra-codegen"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "hydra-core",
@@ -333,7 +333,7 @@ dependencies = [
 
 [[package]]
 name = "hydra-core"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "pretty_assertions",
@@ -344,7 +344,7 @@ dependencies = [
 
 [[package]]
 name = "hydra-mcp-stdio"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "notes-example"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -595,7 +595,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "security-scan-example"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "axum",
