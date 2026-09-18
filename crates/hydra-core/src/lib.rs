@@ -42,12 +42,13 @@ pub const GENERATED_HTTP_RESERVED_NAMES: &[&str] = &[
     "response",
 ];
 
-/// Rust keywords rejected as operation/parameter identifiers.
+/// Rust 2024 keywords rejected as operation/parameter identifiers.
 pub const RUST_KEYWORDS: &[&str] = &[
     "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for",
     "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
     "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where",
-    "while", "async", "await", "dyn",
+    "while", "async", "await", "dyn", "abstract", "become", "box", "do", "final", "macro",
+    "override", "priv", "try", "typeof", "unsized", "virtual", "yield", "gen",
 ];
 
 /// An API definition: the operations a project exposes on its surfaces.
@@ -92,6 +93,11 @@ pub struct Operation {
     /// command differently from the operation.
     #[serde(default)]
     pub cli_command: Option<String>,
+    /// Explicit CLI-only boolean presentation flags. These fields are
+    /// generated only into the CLI argument struct; they never become HTTP
+    /// inputs, MCP inputs, or entries in `parameters_json()`.
+    #[serde(default)]
+    pub cli_output_flags: Vec<CliOutputFlag>,
     /// Opt in to raw-request access on the HTTP surface. The generated
     /// handler receives the exact raw body bytes and a header map instead
     /// of decoded/typed extractors, for consumers that verify signatures
@@ -244,6 +250,24 @@ pub struct CliCompanion {
     /// Stable `snake_case` struct field name, e.g. `attach_mime`.
     pub field: String,
     /// Human-readable description for CLI help.
+    pub description: String,
+}
+
+/// An explicit CLI-only boolean presentation flag declared by an operation.
+///
+/// Output flags are intentionally separate from [`Parameter`] and
+/// [`CliCompanion`]: they are not request data and therefore do not flow into
+/// HTTP, MCP, or the generated `parameters_json()` value. V1 is boolean-only;
+/// callers access the generated `bool` field to select their own presentation
+/// behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CliOutputFlag {
+    /// Kebab-case long flag name without a leading `--`.
+    pub flag: String,
+    /// Stable Rust-safe `snake_case` generated field name.
+    pub field: String,
+    /// Human-readable help text emitted with the generated field.
     pub description: String,
 }
 

@@ -119,6 +119,49 @@ validation and persistence. Hydra does not own source-specific event models,
 batch hashing, idempotency, or transactions. `examples/notes` contains a
 tested `ingest_batch` reference operation and is the pattern Iris should use.
 
+### CLI-only boolean presentation flags
+
+An operation can explicitly declare boolean presentation choices that belong
+only to its generated CLI argument struct. They are not parameters: Hydra does
+not add them to HTTP input, MCP input, or `GeneratedCommand::parameters_json()`.
+The consumer reads the generated boolean and decides how to render its own
+output.
+
+```yaml
+- name: list_records
+  description: List records.
+  method: GET
+  path: /records
+  read: true
+  output_type: Vec<Record>
+  parameters:
+    - name: cursor
+      description: Opaque page cursor.
+      type: string
+      required: false
+      location: query
+  cli_output_flags:
+    - flag: include-cursor
+      field: include_cursor
+      description: Include the checkpoint beside each displayed record.
+```
+
+This emits `pub include_cursor: bool` with an explicit
+`#[arg(long = "include-cursor", action = clap::ArgAction::SetTrue)]` attribute:
+the field is `false` when omitted and `true` for `--include-cursor`; it does
+not accept a value. `flag` is kebab-case without `--`, `field` is a Rust-safe
+snake_case field, and both must be unique across parameter fields, effective
+long flags, CLI companions, and clap's reserved `--help`. Output flags require
+a CLI surface and are intentionally boolean-only in v1—no aliases, defaults,
+types, inferred semantics, or runtime actions.
+
+**Rust API compatibility:** adding `cli_output_flags` is source-breaking for
+Rust callers that construct `Operation` with a struct literal. Existing YAML
+definitions remain compatible through `#[serde(default)]`, but direct literals
+must add `cli_output_flags: vec![]`. Account for that public API break when
+selecting the release version; do not hide it in a consumer-only dependency
+repin.
+
 ### Security-scanner consumer boundary
 
 `examples/security-scan` is a deliberately small, fixture-backed consumer

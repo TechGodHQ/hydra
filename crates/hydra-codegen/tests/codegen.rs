@@ -1,7 +1,10 @@
 //! Ported from iris-codegen's test suite, extended for hydra's config knob
 //! and location metadata.
 
-use hydra_codegen::{GenerateConfig, generate_all};
+use std::fs;
+
+use clap::Parser;
+use hydra_codegen::{GenerateConfig, generate_all, write_generated};
 use hydra_core::{ApiDefinition, Delivery, HttpMethod, Operation, Parameter, ParameterLocation};
 use pretty_assertions::assert_eq;
 
@@ -44,6 +47,7 @@ fn context_page_definition() -> ApiDefinition {
                 hydra_core::Surface::Mcp,
             ]),
             cli_command: None,
+            cli_output_flags: vec![],
             raw_request: false,
         }],
     }
@@ -70,6 +74,7 @@ fn sample_definition() -> ApiDefinition {
             delivery: Delivery::Unary,
             surfaces: None,
             cli_command: None,
+            cli_output_flags: vec![],
             raw_request: false,
         }],
     }
@@ -116,6 +121,7 @@ fn adding_operation_changes_every_surface() {
         delivery: Delivery::Unary,
         surfaces: None,
         cli_command: None,
+        cli_output_flags: vec![],
         raw_request: false,
     });
     let after = generate_all(&definition, &GenerateConfig::default());
@@ -149,6 +155,7 @@ fn sse_operations_are_excluded_from_mcp_and_unary_routes() {
         delivery: Delivery::Sse,
         surfaces: Some(vec![hydra_core::Surface::Http, hydra_core::Surface::Cli]),
         cli_command: Some("watch".into()),
+        cli_output_flags: vec![],
         raw_request: false,
     });
     let artifacts = generate_all(&definition, &GenerateConfig::default());
@@ -284,6 +291,7 @@ fn raw_request_operation_generates_raw_handler() {
         delivery: Delivery::Unary,
         surfaces: Some(vec![hydra_core::Surface::Http]),
         cli_command: None,
+        cli_output_flags: vec![],
         raw_request: true,
     });
     let artifacts = generate_all(&definition, &GenerateConfig::default());
@@ -341,6 +349,7 @@ fn raw_request_operation_with_path_parameter_extracts_typed_path() {
         delivery: Delivery::Unary,
         surfaces: Some(vec![hydra_core::Surface::Http]),
         cli_command: None,
+        cli_output_flags: vec![],
         raw_request: true,
     });
     let artifacts = generate_all(&definition, &GenerateConfig::default());
@@ -753,4 +762,342 @@ fn required_multiple_flag_carries_required_true() {
     parameter.required = true;
     let artifacts = generate_all(&definition, &GenerateConfig::default());
     assert!(artifacts.cli_rs.contains("required = true"));
+}
+
+// ── CLI-only output flags (COD-486) ────────────────────────────────────────
+
+mod cli_output_flags_fixture {
+    include!("fixtures/cli-output-flags/cli.rs");
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "fixture")]
+struct FixtureCli {
+    #[command(subcommand)]
+    command: cli_output_flags_fixture::GeneratedCommand,
+}
+
+fn cli_output_flags_definition() -> ApiDefinition {
+    let definition: ApiDefinition =
+        serde_yaml::from_str(include_str!("fixtures/cli-output-flags/operations.yaml"))
+            .expect("fixture YAML parses");
+    hydra_core::validate::validate_definition(&definition).expect("fixture definition validates");
+    definition
+}
+
+fn parameters_json_section(cli: &str) -> &str {
+    let start = cli
+        .find("    pub fn parameters_json")
+        .expect("generated CLI has parameters_json");
+    let end = cli[start..]
+        .find("\n}\n\n")
+        .expect("GeneratedCommand impl closes after parameters_json");
+    &cli[start..start + end + "\n}\n".len()]
+}
+
+#[test]
+fn output_flags_compile_and_parse_as_boolean_presentation_options() {
+    let absent = FixtureCli::try_parse_from([
+        "fixture",
+        "list-records",
+        "--cursor",
+        "checkpoint-1",
+        "--query",
+        "pending",
+        "--label",
+        "triage",
+    ])
+    .expect("absent output flag parses");
+    match absent.command {
+        cli_output_flags_fixture::GeneratedCommand::ListRecords(args) => {
+            assert!(!args.include_cursor);
+            assert_eq!(args.cursor.as_deref(), Some("checkpoint-1"));
+            assert_eq!(args.query.as_deref(), Some("pending"));
+            assert_eq!(args.label, Some(vec!["triage".to_owned()]));
+        }
+        _ => panic!("expected list-records command"),
+    }
+
+    let present = FixtureCli::try_parse_from([
+        "fixture",
+        "list-records",
+        "--cursor",
+        "checkpoint-1",
+        "--include-cursor",
+    ])
+    .expect("present output flag parses");
+    assert_eq!(present.command.operation_name(), "list_records");
+    let params = present.command.parameters_json();
+    match present.command {
+        cli_output_flags_fixture::GeneratedCommand::ListRecords(args) => {
+            assert!(args.include_cursor);
+        }
+        _ => panic!("expected list-records command"),
+    }
+    assert_eq!(
+        params,
+        serde_json::json!({"cursor": "checkpoint-1", "query": null, "label": null})
+    );
+
+    assert!(
+        FixtureCli::try_parse_from(["fixture", "list-records", "--include-cursor=true",]).is_err(),
+        "SetTrue must reject a supplied boolean value"
+    );
+
+    let zero_parameter = FixtureCli::try_parse_from(["fixture", "status", "--verbose"])
+        .expect("zero-parameter output flag parses");
+    let params = zero_parameter.command.parameters_json();
+    match zero_parameter.command {
+        cli_output_flags_fixture::GeneratedCommand::Status(args) => assert!(args.verbose),
+        _ => panic!("expected status command"),
+    }
+    assert_eq!(params, serde_json::json!({}));
+}
+
+#[test]
+fn output_flags_stay_out_of_request_and_mcp_projections() {
+    let definition = cli_output_flags_definition();
+    let with_output_flags = generate_all(&definition, &GenerateConfig::default());
+    let mut without_output_flags = definition;
+    for operation in &mut without_output_flags.operations {
+        operation.cli_output_flags.clear();
+    }
+    let without_output_flags = generate_all(&without_output_flags, &GenerateConfig::default());
+
+    assert_eq!(
+        parameters_json_section(&with_output_flags.cli_rs),
+        parameters_json_section(&without_output_flags.cli_rs),
+        "presentation flags must not change request projection"
+    );
+    assert!(
+        with_output_flags
+            .cli_rs
+            .contains("pub include_cursor: bool")
+    );
+    assert!(with_output_flags.cli_rs.contains("pub verbose: bool"));
+    assert!(!with_output_flags.http_rs.contains("include_cursor"));
+    assert!(!with_output_flags.http_rs.contains("verbose"));
+
+    let mcp: serde_json::Value = serde_json::from_str(&with_output_flags.mcp_json).unwrap();
+    assert!(
+        mcp["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .any(|tool| tool["name"] == "list_records")
+    );
+    assert!(
+        mcp["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .all(|tool| tool["name"] != "subscribe_events")
+    );
+    assert_eq!(
+        mcp["tools"][0]["inputSchema"]["properties"]["cursor"]["type"],
+        "string"
+    );
+    assert!(
+        mcp["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .all(|tool| tool["inputSchema"]["properties"]
+                .get("include_cursor")
+                .is_none()),
+        "output flags must not become MCP inputs"
+    );
+}
+
+#[test]
+fn output_flag_fixture_is_fresh_and_deterministic() {
+    let definition = cli_output_flags_definition();
+    let first = generate_all(&definition, &GenerateConfig::default());
+    let second = generate_all(&definition, &GenerateConfig::default());
+    assert_eq!(first.cli_rs, second.cli_rs);
+    assert_eq!(first.http_rs, second.http_rs);
+    assert_eq!(first.mcp_json, second.mcp_json);
+
+    let temp = tempfile::tempdir().expect("temporary generated-artifact directory");
+    let first_dir = temp.path().join("first");
+    let second_dir = temp.path().join("second");
+    write_generated(&first_dir, &first).expect("write first generated artifact set");
+    write_generated(&second_dir, &second).expect("write second generated artifact set");
+
+    for artifact in ["cli.rs", "http.rs", "mcp.json"] {
+        assert_eq!(
+            fs::read(first_dir.join(artifact)).expect("read first generated artifact"),
+            fs::read(second_dir.join(artifact)).expect("read second generated artifact"),
+            "two generated writes must be byte-identical for {artifact}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(first_dir.join("cli.rs")).expect("read written CLI fixture"),
+        include_str!("fixtures/cli-output-flags/cli.rs"),
+        "committed compiled CLI fixture must match fresh generation"
+    );
+}
+
+#[test]
+fn output_flags_validate_the_complete_cli_namespace() {
+    let mut definition = cli_output_flags_definition();
+    definition.operations[0].cli_output_flags[0].flag = "include_cursor".into();
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+
+    let mut definition = cli_output_flags_definition();
+    definition.operations[0].cli_output_flags[0].field = "include-cursor".into();
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+
+    let mut definition = cli_output_flags_definition();
+    definition.operations[0].cli_output_flags[0].flag = "cursor".into();
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+
+    let mut definition = cli_output_flags_definition();
+    definition.operations[0].cli_output_flags[0].flag = "label".into();
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+
+    let mut definition = cli_output_flags_definition();
+    definition.operations[0].parameters[0].location = ParameterLocation::Path;
+    definition.operations[0].path = "/records/{cursor}".into();
+    definition.operations[0].cli_output_flags[0].field = "cursor".into();
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+
+    let mut definition = cli_output_flags_definition();
+    definition.operations[0].cli_output_flags[0].flag = "help".into();
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+
+    let mut definition = cli_output_flags_definition();
+    definition.operations[1].cli_output_flags[0].flag = "show-help-details".into();
+    definition.operations[1].cli_output_flags[0].field = "help".into();
+    let error = hydra_core::validate::validate_definition(&definition)
+        .expect_err("clap's help argument ID must be reserved");
+    assert!(error.to_string().contains("reserved help argument"));
+
+    let mut definition = cli_output_flags_definition();
+    definition.operations[0].parameters[0].name = "help".into();
+    let error = hydra_core::validate::validate_definition(&definition)
+        .expect_err("parameter fields must not collide with clap's help argument");
+    assert!(error.to_string().contains("colliding CLI fields"));
+
+    let mut definition = cli_output_flags_definition();
+    definition.operations[0].parameters[1]
+        .cli
+        .as_mut()
+        .unwrap()
+        .companions[0]
+        .flag = "help".into();
+    let error = hydra_core::validate::validate_definition(&definition)
+        .expect_err("companion flags must not collide with clap's --help flag");
+    assert!(error.to_string().contains("colliding CLI flags"));
+
+    let mut definition = cli_output_flags_definition();
+    definition.operations[0].parameters[1]
+        .cli
+        .as_mut()
+        .unwrap()
+        .companions[0]
+        .field = "help".into();
+    let error = hydra_core::validate::validate_definition(&definition)
+        .expect_err("companion fields must not collide with clap's help argument");
+    assert!(error.to_string().contains("colliding CLI fields"));
+
+    let mut definition = cli_output_flags_definition();
+    definition.operations[1].cli_output_flags[0].field = "gen".into();
+    let error = hydra_core::validate::validate_definition(&definition)
+        .expect_err("Rust 2024's gen keyword must be rejected before generation");
+    assert!(
+        error
+            .to_string()
+            .contains("Rust-safe snake_case identifier")
+    );
+
+    for keyword in ["try", "yield"] {
+        let mut definition = cli_output_flags_definition();
+        definition.operations[1].cli_output_flags[0].field = keyword.into();
+        let error = hydra_core::validate::validate_definition(&definition)
+            .expect_err("all Rust 2024 keywords must be rejected before generation");
+        assert!(
+            error
+                .to_string()
+                .contains("Rust-safe snake_case identifier"),
+            "{keyword} must be rejected as a generated field"
+        );
+    }
+
+    let mut definition = cli_output_flags_definition();
+    definition.operations[0]
+        .cli_output_flags
+        .push(hydra_core::CliOutputFlag {
+            flag: "include-cursor".into(),
+            field: "other_field".into(),
+            description: "Duplicate flag.".into(),
+        });
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+
+    let mut definition = cli_output_flags_definition();
+    definition.operations[0]
+        .cli_output_flags
+        .push(hydra_core::CliOutputFlag {
+            flag: "other-flag".into(),
+            field: "include_cursor".into(),
+            description: "Duplicate field.".into(),
+        });
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+
+    let mut definition = cli_output_flags_definition();
+    definition.operations[0].surfaces = Some(vec![hydra_core::Surface::Http]);
+    let error = hydra_core::validate::validate_definition(&definition)
+        .expect_err("output flags without CLI must fail");
+    assert!(error.to_string().contains("cli_output_flags"));
+}
+
+#[test]
+fn output_flags_use_the_actual_multiple_override_long_namespace() {
+    // `multiple` emits an explicit `long = cli.effective_flag(field)`.
+    // With no override, that preserves `record_ids` rather than clap's normal
+    // kebab-case derivation, so the distinct presentation flag `record-ids`
+    // must validate and generate alongside it.
+    let mut definition = definition_with_attachments();
+    let parameter = &mut definition.operations[0].parameters[1];
+    parameter.name = "record_ids".into();
+    parameter.cli = Some(hydra_core::CliOverride {
+        flag: None,
+        multiple: true,
+        companions: vec![],
+    });
+    definition.operations[0].cli_output_flags = vec![hydra_core::CliOutputFlag {
+        flag: "record-ids".into(),
+        field: "show_record_ids".into(),
+        description: "Show record identifiers in CLI output.".into(),
+    }];
+
+    hydra_core::validate::validate_definition(&definition)
+        .expect("distinct emitted long flags validate");
+    let artifacts = generate_all(&definition, &GenerateConfig::default());
+    assert!(artifacts.cli_rs.contains(
+        "#[arg(long = \"record_ids\", action = clap::ArgAction::Append, required = false)]"
+    ));
+    assert!(artifacts.cli_rs.contains(
+        "#[arg(long = \"record-ids\", action = clap::ArgAction::SetTrue)]\n    pub show_record_ids: bool"
+    ));
+}
+
+#[test]
+fn output_flag_yaml_rejects_unknown_keys() {
+    let yaml = r"
+operations:
+  - name: status
+    description: Read status.
+    method: GET
+    path: /status
+    read: true
+    output_type: Status
+    parameters: []
+    cli_output_flags:
+      - flag: verbose
+        field: verbose
+        description: Show details.
+        unknown: rejected
+";
+    assert!(serde_yaml::from_str::<ApiDefinition>(yaml).is_err());
 }
