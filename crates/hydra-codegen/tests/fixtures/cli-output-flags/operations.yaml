@@ -1,0 +1,57 @@
+operations:
+  - name: list_records
+    description: List records with an explicit presentation flag.
+    method: GET
+    path: /records
+    read: true
+    output_type: Vec<Record>
+    parameters:
+      - name: cursor
+        description: Opaque query cursor.
+        type: string
+        required: false
+        location: query
+      - name: query
+        description: Optional query text.
+        type: string
+        required: false
+        location: query
+        cli:
+          companions:
+            - flag: label
+              field: label
+              description: Optional CLI-only labels for the query.
+    cli_output_flags:
+      - flag: include-cursor
+        field: include_cursor
+        description: Include the checkpoint alongside each displayed record.
+  - name: status
+    description: Read status without request parameters.
+    method: GET
+    path: /status
+    read: true
+    output_type: Status
+    parameters: []
+    cli_output_flags:
+      - flag: verbose
+        field: verbose
+        description: Include verbose status presentation details.
+  - name: subscribe_events
+    description: Stream events over HTTP and CLI only.
+    method: GET
+    path: /events
+    read: true
+    output_type: Event
+    parameters:
+      - name: cursor
+        description: Opaque replay cursor.
+        type: string
+        required: false
+        location: query
+    delivery: sse
+    surfaces: [http, cli]
+    cli_command: watch
+    cli_output_flags:
+      - flag: include-cursor
+        field: include_cursor
+        description: Include the checkpoint alongside each streamed event.

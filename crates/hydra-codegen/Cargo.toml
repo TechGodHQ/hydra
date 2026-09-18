@@ -19,3 +19,5 @@ anyhow = { workspace = true }
 [dev-dependencies]
 pretty_assertions = "1"
 tempfile = "3"
+clap = { workspace = true }
+serde = { workspace = true }

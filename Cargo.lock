@@ -323,6 +323,7 @@ name = "hydra-codegen"
 version = "0.2.2"
 dependencies = [
  "anyhow",
+ "clap",
  "hydra-core",
  "pretty_assertions",
  "serde",

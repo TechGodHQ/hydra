@@ -203,6 +203,10 @@ fn generate_cli(definition: &ApiDefinition) -> String {
                 }
             }
         }
+        for output_flag in &operation.cli_output_flags {
+            push_doc_comment(&mut out, "    ", &output_flag.description);
+            emit_cli_output_flag(&mut out, output_flag);
+        }
         out.push_str("}\n\n");
     }
 
@@ -260,6 +264,22 @@ fn emit_cli_field(
     out.push_str(": ");
     out.push_str(&field_type);
     out.push_str(",\n");
+}
+
+/// Emit one explicit CLI-only boolean presentation flag.
+///
+/// Output flags are never request parameters, so `parameters_json()` omits
+/// them. `SetTrue` gives the public boolean contract directly: absent is
+/// `false`, present is `true`, and clap rejects a supplied value.
+fn emit_cli_output_flag(out: &mut String, output_flag: &hydra_core::CliOutputFlag) {
+    push_fmt!(
+        out,
+        "    #[arg(long = {}, action = clap::ArgAction::SetTrue)]\n",
+        rust_string_literal(&output_flag.flag)
+    );
+    out.push_str("    pub ");
+    out.push_str(&output_flag.field);
+    out.push_str(": bool,\n");
 }
 
 fn cli_operations(definition: &ApiDefinition) -> impl Iterator<Item = &Operation> {

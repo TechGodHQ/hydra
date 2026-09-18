@@ -1,0 +1,3 @@
+# The compiled fixture is copied byte-for-byte from hydra's generated CLI
+# output, whose stable format ends with one blank line.
+cli.rs whitespace=-blank-at-eof

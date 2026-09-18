@@ -136,6 +136,14 @@ fn validate_operation_cli_overrides(operation: &Operation) -> Result<()> {
     // CLI shape — so explicit overrides cannot collide with defaults.
     let mut cli_fields: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut cli_flags: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    validate_cli_output_flags(operation, &mut cli_fields, &mut cli_flags)?;
+    // Clap supplies a `help` argument and `--help` flag for every generated
+    // command. Reserve both namespaces before registering the existing
+    // parameter and companion shapes too; otherwise a legacy/default-shaped
+    // parameter can still make generated parsing panic even though output
+    // flags themselves reject the reserved names.
+    cli_fields.insert("help".to_owned());
+    cli_flags.insert("help".to_owned());
 
     for parameter in &operation.parameters {
         let label = format!("{}.{}", operation.name, parameter.name);
@@ -182,8 +190,11 @@ fn validate_operation_cli_overrides(operation: &Operation) -> Result<()> {
         }
 
         // Register the parameter's CLI field name and, for non-positional
-        // parameters, its effective long flag (declared override or the
-        // kebab-case derivation clap applies to the field name).
+        // parameters, its actual generated long flag. Most default fields use
+        // clap's kebab-case derivation, but a `multiple` override emits an
+        // explicit `long = ...` attribute whose omitted flag preserves the
+        // parameter spelling. Validation must reserve what codegen emits, not
+        // a normalized approximation of it.
         anyhow::ensure!(
             cli_fields.insert(parameter.name.clone()),
             "operation {} declares colliding CLI fields: {}",
@@ -191,11 +202,7 @@ fn validate_operation_cli_overrides(operation: &Operation) -> Result<()> {
             parameter.name
         );
         if parameter.location != ParameterLocation::Path {
-            let effective_flag = parameter
-                .cli
-                .as_ref()
-                .and_then(|cli| cli.flag.clone())
-                .unwrap_or_else(|| parameter.name.replace('_', "-"));
+            let effective_flag = effective_cli_long_flag(parameter);
             anyhow::ensure!(
                 cli_flags.insert(effective_flag.clone()),
                 "operation {} declares colliding CLI flags: {effective_flag}",
@@ -230,6 +237,84 @@ fn validate_operation_cli_overrides(operation: &Operation) -> Result<()> {
                 );
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Return the exact long-option spelling emitted for a non-positional
+/// parameter.
+///
+/// Scalar/default fields use clap's normal `snake_case` to `kebab-case`
+/// derivation. Repeatable JSON overrides deliberately emit an explicit long
+/// attribute so a missing `cli.flag` preserves the declared parameter spelling;
+/// this distinction keeps validation's collision namespace identical to the
+/// generated CLI.
+fn effective_cli_long_flag(parameter: &crate::Parameter) -> String {
+    match parameter.cli.as_ref() {
+        Some(cli) if cli.multiple => cli.effective_flag(&parameter.name),
+        Some(cli) => cli
+            .flag
+            .clone()
+            .unwrap_or_else(|| parameter.name.replace('_', "-")),
+        None => parameter.name.replace('_', "-"),
+    }
+}
+
+/// Validate and register operation-level presentation flags before
+/// parameter/companion registration claims the remaining CLI namespace.
+fn validate_cli_output_flags(
+    operation: &Operation,
+    cli_fields: &mut std::collections::BTreeSet<String>,
+    cli_flags: &mut std::collections::BTreeSet<String>,
+) -> Result<()> {
+    if !operation.generates_cli() {
+        anyhow::ensure!(
+            operation.cli_output_flags.is_empty(),
+            "operation {} declares cli_output_flags but does not generate the CLI surface",
+            operation.name
+        );
+        return Ok(());
+    }
+
+    // Output flags are presentation-only booleans. Subsequent parameter and
+    // companion registration checks these claims against default-shaped and
+    // positional fields, while the flags never enter request projection.
+    for output_flag in &operation.cli_output_flags {
+        anyhow::ensure!(
+            is_kebab_case(&output_flag.flag),
+            "operation {} declares cli output flag {:?} which is not kebab-case",
+            operation.name,
+            output_flag.flag
+        );
+        anyhow::ensure!(
+            is_valid_identifier(&output_flag.field),
+            "operation {} declares cli output field {:?} which is not a Rust-safe snake_case identifier",
+            operation.name,
+            output_flag.field
+        );
+        anyhow::ensure!(
+            output_flag.flag != "help",
+            "operation {} declares cli output flag help, which collides with clap's reserved --help flag",
+            operation.name
+        );
+        anyhow::ensure!(
+            output_flag.field != "help",
+            "operation {} declares cli output field help, which collides with clap's reserved help argument",
+            operation.name
+        );
+        anyhow::ensure!(
+            cli_flags.insert(output_flag.flag.clone()),
+            "operation {} declares colliding CLI flags: {}",
+            operation.name,
+            output_flag.flag
+        );
+        anyhow::ensure!(
+            cli_fields.insert(output_flag.field.clone()),
+            "operation {} declares colliding CLI fields: {} (output flag field)",
+            operation.name,
+            output_flag.field
+        );
     }
     Ok(())
 }
