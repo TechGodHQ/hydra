@@ -1,12 +1,77 @@
 //! Ported from iris-codegen's test suite, extended for hydra's config knob
 //! and location metadata.
 
-use std::fs;
+use std::{collections::BTreeMap, fs};
 
+use axum::{
+    Router,
+    body::{Body, to_bytes},
+    extract::Query,
+    http::{Request, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::get,
+};
 use clap::Parser;
 use hydra_codegen::{GenerateConfig, generate_all, write_generated};
 use hydra_core::{ApiDefinition, Delivery, HttpMethod, Operation, Parameter, ParameterLocation};
 use pretty_assertions::assert_eq;
+use tower::ServiceExt;
+
+#[allow(dead_code)]
+mod http_error_responses_fixture {
+    include!("fixtures/http-error-responses/http.rs");
+}
+
+#[derive(Clone, Default)]
+struct HttpErrorFixtureState;
+
+#[allow(clippy::unused_async)]
+async fn http_error_fixture_dispatch(
+    _state: &HttpErrorFixtureState,
+    operation: &str,
+    input: http_error_responses_fixture::GeneratedOperationInput,
+) -> Response {
+    assert_eq!(operation, "read_events", "fixture dispatch is unary-only");
+    match input.query.get("mode").map(String::as_str) {
+        Some("limited") => http_error_responses_fixture::read_events_http_errors::rate_limited(
+            "30".to_owned(),
+            Some("backoff".to_owned()),
+        )
+        .into_response(),
+        _ => axum::Json(serde_json::json!({"events": []})).into_response(),
+    }
+}
+
+#[allow(dead_code, clippy::missing_const_for_fn)]
+fn bind_runtime_sse_subscribe_events(
+    router: Router<HttpErrorFixtureState>,
+) -> Router<HttpErrorFixtureState> {
+    router.route("/events/stream", get(http_error_fixture_sse))
+}
+
+async fn http_error_fixture_sse(Query(query): Query<BTreeMap<String, String>>) -> Response {
+    match query.get("mode").map(String::as_str) {
+        Some("invalid") => {
+            http_error_responses_fixture::subscribe_events_http_errors::invalid_replay_cursor()
+                .into_response()
+        }
+        Some("expired") => {
+            http_error_responses_fixture::subscribe_events_http_errors::replay_cursor_expired(Some(
+                "cursor-17".to_owned(),
+            ))
+            .into_response()
+        }
+        Some("expired-without-oldest") => {
+            http_error_responses_fixture::subscribe_events_http_errors::replay_cursor_expired(None)
+                .into_response()
+        }
+        Some("unavailable") => {
+            http_error_responses_fixture::subscribe_events_http_errors::stream_unavailable()
+                .into_response()
+        }
+        _ => StatusCode::NO_CONTENT.into_response(),
+    }
+}
 
 fn context_page_definition() -> ApiDefinition {
     // Pagination retention/replay and the concrete `ContextPage.next_cursor`
@@ -48,6 +113,7 @@ fn context_page_definition() -> ApiDefinition {
             ]),
             cli_command: None,
             cli_output_flags: vec![],
+            http_error_responses: vec![],
             raw_request: false,
         }],
     }
@@ -75,6 +141,7 @@ fn sample_definition() -> ApiDefinition {
             surfaces: None,
             cli_command: None,
             cli_output_flags: vec![],
+            http_error_responses: vec![],
             raw_request: false,
         }],
     }
@@ -122,6 +189,7 @@ fn adding_operation_changes_every_surface() {
         surfaces: None,
         cli_command: None,
         cli_output_flags: vec![],
+        http_error_responses: vec![],
         raw_request: false,
     });
     let after = generate_all(&definition, &GenerateConfig::default());
@@ -156,6 +224,7 @@ fn sse_operations_are_excluded_from_mcp_and_unary_routes() {
         surfaces: Some(vec![hydra_core::Surface::Http, hydra_core::Surface::Cli]),
         cli_command: Some("watch".into()),
         cli_output_flags: vec![],
+        http_error_responses: vec![],
         raw_request: false,
     });
     let artifacts = generate_all(&definition, &GenerateConfig::default());
@@ -292,6 +361,7 @@ fn raw_request_operation_generates_raw_handler() {
         surfaces: Some(vec![hydra_core::Surface::Http]),
         cli_command: None,
         cli_output_flags: vec![],
+        http_error_responses: vec![],
         raw_request: true,
     });
     let artifacts = generate_all(&definition, &GenerateConfig::default());
@@ -350,6 +420,7 @@ fn raw_request_operation_with_path_parameter_extracts_typed_path() {
         surfaces: Some(vec![hydra_core::Surface::Http]),
         cli_command: None,
         cli_output_flags: vec![],
+        http_error_responses: vec![],
         raw_request: true,
     });
     let artifacts = generate_all(&definition, &GenerateConfig::default());
@@ -1100,4 +1171,322 @@ operations:
         unknown: rejected
 ";
     assert!(serde_yaml::from_str::<ApiDefinition>(yaml).is_err());
+}
+
+// ── Typed HTTP error responses (COD-487) ───────────────────────────────────
+
+fn http_error_responses_definition() -> ApiDefinition {
+    let definition: ApiDefinition = serde_yaml::from_str(include_str!(
+        "fixtures/http-error-responses/operations.yaml"
+    ))
+    .expect("HTTP-error fixture YAML parses");
+    hydra_core::validate::validate_definition(&definition)
+        .expect("HTTP-error fixture definition validates");
+    definition
+}
+
+fn http_error_responses_config() -> GenerateConfig {
+    GenerateConfig {
+        http_dispatch_fn: "crate::http_error_fixture_dispatch".into(),
+        http_state_type: "crate::HttpErrorFixtureState".into(),
+        sse_binding_prefix: "crate::".into(),
+        ..GenerateConfig::default()
+    }
+}
+
+async fn http_error_fixture_response(uri: &str) -> Response {
+    http_error_responses_fixture::bind_subscribe_events(
+        http_error_responses_fixture::generated_router(),
+    )
+    .with_state(HttpErrorFixtureState)
+    .oneshot(
+        Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .expect("fixture request builds"),
+    )
+    .await
+    .expect("generated fixture router returns a response")
+}
+
+async fn json_fixture_response(uri: &str) -> (StatusCode, String, serde_json::Value) {
+    let response = http_error_fixture_response(uri).await;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read generated response body");
+    let value = serde_json::from_slice(&body).expect("generated response is JSON");
+    (status, content_type, value)
+}
+
+#[tokio::test]
+async fn http_error_responses_are_generated_and_execute_through_the_real_router() {
+    // The existing SSE binding hook owns the handler. It returns generated
+    // error constructors before a stream opens, so these error paths must be
+    // normal JSON responses rather than an SSE content type or sentinel.
+    let (status, content_type, body) = json_fixture_response("/events/stream?mode=invalid").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(content_type, "application/json");
+    assert_eq!(body, serde_json::json!({"error": "invalid_replay_cursor"}));
+
+    let (status, content_type, body) = json_fixture_response("/events/stream?mode=expired").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(content_type, "application/json");
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "error": "replay_cursor_expired",
+            "oldest_cursor": "cursor-17"
+        })
+    );
+
+    let (status, content_type, body) =
+        json_fixture_response("/events/stream?mode=expired-without-oldest").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(content_type, "application/json");
+    assert_eq!(body, serde_json::json!({"error": "replay_cursor_expired"}));
+    assert!(
+        body.get("oldest_cursor").is_none(),
+        "optional fields must be omitted rather than serialized as null"
+    );
+
+    // Unary operations use the same generated conversion types, without
+    // changing the established generated dispatch signature.
+    let (status, content_type, body) = json_fixture_response("/events?mode=limited").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(content_type, "application/json");
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "error": "rate \u{1} \"limited\"",
+            "retry_after": "30",
+            "retry_hint": "backoff"
+        })
+    );
+
+    let (status, content_type, body) =
+        json_fixture_response("/events/stream?mode=unavailable").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(content_type, "application/json");
+    assert_eq!(body, serde_json::json!({"error": "stream_unavailable"}));
+}
+
+#[test]
+fn http_error_responses_preserve_non_http_projections_and_private_state() {
+    let definition = http_error_responses_definition();
+    let with_errors = generate_all(&definition, &http_error_responses_config());
+    let mut without_errors = definition;
+    for operation in &mut without_errors.operations {
+        operation.http_error_responses.clear();
+    }
+    let without_errors = generate_all(&without_errors, &http_error_responses_config());
+
+    assert_eq!(with_errors.cli_rs, without_errors.cli_rs);
+    assert_eq!(with_errors.mcp_json, without_errors.mcp_json);
+    assert!(with_errors.cli_rs.contains("ReadEvents(ReadEventsArgs)"));
+    assert!(with_errors.mcp_json.contains("\"read_events\""));
+    assert_ne!(with_errors.http_rs, without_errors.http_rs);
+    assert!(
+        with_errors
+            .http_rs
+            .contains("pub mod read_events_http_errors")
+    );
+    assert!(
+        with_errors
+            .http_rs
+            .contains("pub mod subscribe_events_http_errors")
+    );
+    assert!(with_errors.http_rs.contains(
+        "pub fn replay_cursor_expired(oldest_cursor: Option<String>) -> ReplayCursorExpiredResponse"
+    ));
+    assert!(
+        with_errors
+            .http_rs
+            .contains("pub fn rate_limited(retry_after: String, retry_hint: Option<String>) -> RateLimitedResponse")
+    );
+    assert!(with_errors.http_rs.contains(
+        "pub struct InvalidReplayCursorResponse {\n        body: InvalidReplayCursorBody,"
+    ));
+    assert!(!with_errors.http_rs.contains(
+        "pub struct InvalidReplayCursorResponse {\n        pub body: InvalidReplayCursorBody,"
+    ));
+    assert!(with_errors.http_rs.contains(
+        "(StatusCode::from_u16(400).expect(\"validated HTTP error status\"), Json(self.body)).into_response()"
+    ));
+    assert!(
+        !with_errors.http_rs.contains(".route(\"/events/stream\""),
+        "SSE retains its runtime binding rather than gaining a duplicate route"
+    );
+}
+
+#[test]
+fn http_error_response_fixture_is_fresh_and_byte_deterministic() {
+    let definition = http_error_responses_definition();
+    let config = http_error_responses_config();
+    let first = generate_all(&definition, &config);
+    let second = generate_all(&definition, &config);
+    assert_eq!(first.cli_rs, second.cli_rs);
+    assert_eq!(first.http_rs, second.http_rs);
+    assert_eq!(first.mcp_json, second.mcp_json);
+
+    let temp = tempfile::tempdir().expect("temporary generated-artifact directory");
+    let first_dir = temp.path().join("first");
+    let second_dir = temp.path().join("second");
+    write_generated(&first_dir, &first).expect("write first generated artifact set");
+    write_generated(&second_dir, &second).expect("write second generated artifact set");
+    for artifact in ["cli.rs", "http.rs", "mcp.json"] {
+        assert_eq!(
+            fs::read(first_dir.join(artifact)).expect("read first generated artifact"),
+            fs::read(second_dir.join(artifact)).expect("read second generated artifact"),
+            "two generated writes must be byte-identical for {artifact}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(first_dir.join("http.rs")).expect("read written HTTP fixture"),
+        include_str!("fixtures/http-error-responses/http.rs"),
+        "compiled committed HTTP fixture must match fresh generation"
+    );
+
+    // A historical no-error HTTP fixture remains byte-identical even after
+    // adding the default-empty declaration to Operation.
+    let no_error_definition: ApiDefinition =
+        serde_yaml::from_str(include_str!("fixtures/notes-pre-raw-operations.yaml"))
+            .expect("historic no-error YAML parses");
+    let no_error_config = GenerateConfig {
+        http_dispatch_fn: "crate::execute_operation_http".to_string(),
+        http_state_type: "crate::AppState".to_string(),
+        sse_binding_prefix: "super::".to_string(),
+        ..GenerateConfig::default()
+    };
+    assert_eq!(
+        generate_all(&no_error_definition, &no_error_config).http_rs,
+        include_str!("fixtures/notes-pre-raw-http.rs")
+    );
+}
+
+#[test]
+fn http_error_response_validation_rejects_ambiguous_or_malformed_declarations() {
+    let mut definition = http_error_responses_definition();
+    definition.operations[0].http_error_responses[0].status = 399;
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+
+    let mut definition = http_error_responses_definition();
+    definition.operations[0].http_error_responses[0].status = 600;
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+
+    let mut definition = http_error_responses_definition();
+    definition.operations[0].http_error_responses[0].fields[2].constant = Some("never".into());
+    let error = hydra_core::validate::validate_definition(&definition)
+        .expect_err("optional constants must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("constants require required: true")
+    );
+
+    let mut definition = http_error_responses_definition();
+    let duplicate = definition.operations[0].http_error_responses[0].clone();
+    definition.operations[0]
+        .http_error_responses
+        .push(duplicate);
+    assert!(hydra_core::validate::validate_definition(&definition).is_err());
+
+    let mut definition = http_error_responses_definition();
+    definition.operations[1].http_error_responses[0].name = "a_b".into();
+    definition.operations[1].http_error_responses[1].name = "a__b".into();
+    let error = hydra_core::validate::validate_definition(&definition)
+        .expect_err("emitted PascalCase response types must not collide");
+    assert!(
+        error
+            .to_string()
+            .contains("collide after generated type casing")
+    );
+
+    let mut definition = http_error_responses_definition();
+    definition.operations[0].surfaces = Some(vec![hydra_core::Surface::Cli]);
+    let error = hydra_core::validate::validate_definition(&definition)
+        .expect_err("HTTP errors without HTTP generation must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("does not generate the HTTP surface")
+    );
+
+    let mut definition = http_error_responses_definition();
+    let mut colliding_operation = definition.operations[0].clone();
+    colliding_operation.name = "read_events_http_errors".into();
+    colliding_operation.path = "/other-events".into();
+    colliding_operation.http_error_responses.clear();
+    definition.operations.push(colliding_operation);
+    let error = hydra_core::validate::validate_definition(&definition)
+        .expect_err("error module must not collide with a generated handler");
+    assert!(
+        error
+            .to_string()
+            .contains("collides with an existing generated HTTP item")
+    );
+
+    let mut definition = http_error_responses_definition();
+    let mut same_status = definition.operations[0].http_error_responses[0].clone();
+    same_status.name = "another_invalid_cursor".into();
+    definition.operations[0]
+        .http_error_responses
+        .push(same_status);
+    hydra_core::validate::validate_definition(&definition)
+        .expect("differently named errors may intentionally share a status");
+}
+
+#[test]
+fn http_error_response_yaml_rejects_unknown_keys_and_unsupported_types() {
+    let unknown_key = r"
+operations:
+  - name: status
+    description: Read status.
+    method: GET
+    path: /status
+    read: true
+    output_type: Status
+    parameters: []
+    http_error_responses:
+      - name: unavailable
+        status: 503
+        fields:
+          - name: error
+            type: string
+            required: true
+            const: unavailable
+            unexpected: rejected
+";
+    assert!(
+        serde_yaml::from_str::<ApiDefinition>(unknown_key).is_err(),
+        "new HTTP-error types must reject unknown YAML keys"
+    );
+
+    let unsupported_type = r"
+operations:
+  - name: status
+    description: Read status.
+    method: GET
+    path: /status
+    read: true
+    output_type: Status
+    parameters: []
+    http_error_responses:
+      - name: unavailable
+        status: 503
+        fields:
+          - name: retry_after
+            type: integer
+            required: true
+";
+    assert!(
+        serde_yaml::from_str::<ApiDefinition>(unsupported_type).is_err(),
+        "v1 error fields support only declared string values"
+    );
 }

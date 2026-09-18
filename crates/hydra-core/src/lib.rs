@@ -98,6 +98,13 @@ pub struct Operation {
     /// inputs, MCP inputs, or entries in `parameters_json()`.
     #[serde(default)]
     pub cli_output_flags: Vec<CliOutputFlag>,
+    /// Explicit typed HTTP error responses generated for this operation.
+    ///
+    /// Error declarations affect only the generated HTTP artifact. They give
+    /// an existing runtime binding fixed status/body constructors without
+    /// changing request inputs, CLI arguments, or MCP schemas.
+    #[serde(default)]
+    pub http_error_responses: Vec<HttpErrorResponse>,
     /// Opt in to raw-request access on the HTTP surface. The generated
     /// handler receives the exact raw body bytes and a header map instead
     /// of decoded/typed extractors, for consumers that verify signatures
@@ -269,6 +276,49 @@ pub struct CliOutputFlag {
     pub field: String,
     /// Human-readable help text emitted with the generated field.
     pub description: String,
+}
+
+/// One fixed HTTP error response declared by an operation.
+///
+/// The response name becomes a generated constructor inside that operation's
+/// HTTP-error module. Its status and body shape are declaration data rather
+/// than runtime guesses; v1 supports only flat string fields.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpErrorResponse {
+    /// Rust-safe `snake_case` constructor name.
+    pub name: String,
+    /// HTTP status code emitted by the generated response (400 through 599).
+    pub status: u16,
+    /// Ordered flat JSON-object fields for this response.
+    pub fields: Vec<HttpErrorField>,
+}
+
+/// One declared field in an [`HttpErrorResponse`] body.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpErrorField {
+    /// Rust-safe `snake_case` field name and exact JSON key.
+    pub name: String,
+    /// The supported v1 field type.
+    #[serde(rename = "type")]
+    pub ty: HttpErrorFieldType,
+    /// Whether this field is always present in the generated JSON object.
+    pub required: bool,
+    /// A fixed string value supplied by the declaration rather than callers.
+    ///
+    /// Constants are permitted only for required fields, so optional fields
+    /// retain their `Option<String>` omission semantics.
+    #[serde(rename = "const", default, skip_serializing_if = "Option::is_none")]
+    pub constant: Option<String>,
+}
+
+/// Field types supported by typed HTTP error responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpErrorFieldType {
+    /// UTF-8 string field.
+    String,
 }
 
 impl CliOverride {

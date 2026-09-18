@@ -9,8 +9,8 @@
 use anyhow::Result;
 
 use crate::{
-    ApiDefinition, GENERATED_HTTP_RESERVED_NAMES, HttpMethod, Operation, ParameterLocation,
-    ParameterType, RUST_KEYWORDS, Surface,
+    ApiDefinition, GENERATED_HTTP_RESERVED_NAMES, HttpErrorFieldType, HttpMethod, Operation,
+    ParameterLocation, ParameterType, RUST_KEYWORDS, Surface,
 };
 
 /// Validate semantic constraints that YAML parsing alone cannot enforce.
@@ -54,7 +54,10 @@ pub fn validate_definition(definition: &ApiDefinition) -> Result<()> {
         validate_operation_surfaces(operation)?;
         validate_operation_raw_request(operation)?;
         validate_operation_cli_overrides(operation)?;
+        validate_operation_http_error_responses(operation)?;
     }
+
+    validate_http_error_module_names(definition)?;
 
     // CLI command overrides must not collide with any generated subcommand.
     let mut cli_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -237,6 +240,126 @@ fn validate_operation_cli_overrides(operation: &Operation) -> Result<()> {
                 );
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Validate typed HTTP-error declarations before code generation.
+///
+/// Error response semantics are deliberately closed in v1: declarations
+/// choose a status and a flat string body shape, while the consuming runtime
+/// decides when to return one. Validation rejects ambiguity before an emitted
+/// public constructor can compile into a misleading wire contract.
+fn validate_operation_http_error_responses(operation: &Operation) -> Result<()> {
+    if operation.http_error_responses.is_empty() {
+        return Ok(());
+    }
+
+    anyhow::ensure!(
+        operation.generates_http(),
+        "operation {} declares http_error_responses but does not generate the HTTP surface",
+        operation.name
+    );
+
+    let mut response_names = std::collections::BTreeSet::new();
+    let mut response_type_names = std::collections::BTreeSet::new();
+    for response in &operation.http_error_responses {
+        anyhow::ensure!(
+            is_valid_identifier(&response.name),
+            "operation {} declares HTTP error response {:?} which is not a Rust-safe snake_case identifier",
+            operation.name,
+            response.name
+        );
+        anyhow::ensure!(
+            response_names.insert(response.name.as_str()),
+            "operation {} declares duplicate HTTP error response name: {}",
+            operation.name,
+            response.name
+        );
+        // Generated body/response type names use PascalCase. Distinct valid
+        // snake-case names such as `a_b` and `a__b` can otherwise collapse to
+        // one Rust item, so reserve the exact emitted identifier too.
+        let response_type_name = pascal_case(&response.name);
+        anyhow::ensure!(
+            response_type_names.insert(response_type_name.clone()),
+            "operation {} declares HTTP error responses that collide after generated type casing: {}",
+            operation.name,
+            response_type_name
+        );
+        anyhow::ensure!(
+            (400..=599).contains(&response.status),
+            "operation {} HTTP error response {} declares status {}; expected 400 through 599",
+            operation.name,
+            response.name,
+            response.status
+        );
+
+        let mut field_names = std::collections::BTreeSet::new();
+        for field in &response.fields {
+            anyhow::ensure!(
+                is_valid_identifier(&field.name),
+                "operation {} HTTP error response {} declares field {:?} which is not a Rust-safe snake_case identifier",
+                operation.name,
+                response.name,
+                field.name
+            );
+            anyhow::ensure!(
+                field_names.insert(field.name.as_str()),
+                "operation {} HTTP error response {} declares duplicate field name: {}",
+                operation.name,
+                response.name,
+                field.name
+            );
+            anyhow::ensure!(
+                matches!(field.ty, HttpErrorFieldType::String),
+                "operation {} HTTP error response {} field {} uses an unsupported type",
+                operation.name,
+                response.name,
+                field.name
+            );
+            anyhow::ensure!(
+                field.constant.is_none() || field.required,
+                "operation {} HTTP error response {} field {} declares const but is optional; constants require required: true",
+                operation.name,
+                response.name,
+                field.name
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Reject collisions between generated HTTP-error module names and existing
+/// generated HTTP items before Rust reports an opaque duplicate-item error.
+fn validate_http_error_module_names(definition: &ApiDefinition) -> Result<()> {
+    let mut generated_item_names = std::collections::BTreeSet::new();
+    for operation in definition
+        .operations
+        .iter()
+        .filter(|op| op.generates_http())
+    {
+        let item_name = if operation.is_sse() {
+            format!("bind_{}", operation.name)
+        } else {
+            operation.name.clone()
+        };
+        generated_item_names.insert(item_name);
+    }
+
+    for operation in definition
+        .operations
+        .iter()
+        .filter(|op| !op.http_error_responses.is_empty())
+    {
+        let module_name = format!("{}_http_errors", operation.name);
+        anyhow::ensure!(
+            generated_item_names.insert(module_name.clone()),
+            "operation {} HTTP error module {} collides with an existing generated HTTP item",
+            operation.name,
+            module_name
+        );
     }
 
     Ok(())
@@ -456,4 +579,21 @@ fn is_snake_case(value: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
         && !value.starts_with('_')
         && !value.ends_with('_')
+}
+
+/// Mirror the code generator's identifier casing for collision validation.
+fn pascal_case(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut upper_next = true;
+    for ch in value.chars() {
+        if ch == '_' {
+            upper_next = true;
+        } else if upper_next {
+            out.extend(ch.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
