@@ -21,3 +21,6 @@ pretty_assertions = "1"
 tempfile = "3"
 clap = { workspace = true }
 serde = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { version = "0.5", features = ["util"] }

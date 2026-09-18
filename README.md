@@ -162,6 +162,68 @@ must add `cli_output_flags: vec![]`. Account for that public API break when
 selecting the release version; do not hide it in a consumer-only dependency
 repin.
 
+### Declared typed HTTP errors
+
+An HTTP-generating operation can declare the fixed error responses that its
+existing runtime binding may return. Hydra owns the wire representation; the
+consumer still owns classification, authentication, and the decision to return
+an error rather than continue its operation or open an SSE stream.
+
+```yaml
+- name: subscribe_events
+  description: Stream normalized events.
+  method: GET
+  path: /events
+  read: true
+  output_type: Event
+  parameters: []
+  delivery: sse
+  surfaces: [http]
+  http_error_responses:
+    - name: invalid_replay_cursor
+      status: 400
+      fields:
+        - name: error
+          type: string
+          required: true
+          const: invalid_replay_cursor
+    - name: replay_cursor_expired
+      status: 409
+      fields:
+        - name: error
+          type: string
+          required: true
+          const: replay_cursor_expired
+        - name: oldest_cursor
+          type: string
+          required: false
+```
+
+The generated HTTP artifact exposes a public
+`subscribe_events_http_errors` module with typed constructors such as
+`invalid_replay_cursor()` and
+`replay_cursor_expired(oldest_cursor: Option<String>)`. Each returned public
+response type implements Axum `IntoResponse`, emits the declared status and an
+`application/json` object, and keeps its status/body state private. Constants
+are declaration-owned and never constructor arguments; optional dynamic fields
+are omitted rather than serialized as `null` when `None`.
+
+V1 is intentionally closed: error names and field names are Rust-safe
+`snake_case`; field names are the exact flat JSON keys; `type: string` is the
+only supported field type; statuses must be 400 through 599; and `const` is a
+string allowed only on required fields. Hydra rejects unknown keys, duplicate
+names, invalid statuses, generated-symbol collisions, and declarations on
+operations without HTTP generation before code generation. The declaration
+does not alter request inputs, CLI arguments, MCP schemas, unary route
+dispatch, or the existing SSE binding hook.
+
+**Rust API compatibility:** adding `http_error_responses` is source-breaking
+for Rust callers that construct `Operation` with a struct literal. Existing
+YAML definitions remain compatible through `#[serde(default)]`, but direct
+literals must add `http_error_responses: vec![]`. Account for that public API
+break when selecting a future release version; do not hide it in a consumer
+dependency repin.
+
 ### Security-scanner consumer boundary
 
 `examples/security-scan` is a deliberately small, fixture-backed consumer

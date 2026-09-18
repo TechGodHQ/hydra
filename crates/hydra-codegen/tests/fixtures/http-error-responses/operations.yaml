@@ -1,0 +1,62 @@
+operations:
+  - name: read_events
+    description: Read an event page through the generated unary route.
+    method: GET
+    path: /events
+    read: true
+    output_type: EventPage
+    parameters:
+      - name: mode
+        description: Select the fixture response mode.
+        type: string
+        required: false
+        location: query
+    surfaces: [http, cli, mcp]
+    http_error_responses:
+      - name: rate_limited
+        status: 429
+        fields:
+          - name: error
+            type: string
+            required: true
+            const: "rate \u0001 \"limited\""
+          - name: retry_after
+            type: string
+            required: true
+          - name: retry_hint
+            type: string
+            required: false
+  - name: subscribe_events
+    description: Stream events through the existing runtime binding hook.
+    method: GET
+    path: /events/stream
+    read: true
+    output_type: Event
+    parameters: []
+    delivery: sse
+    surfaces: [http]
+    http_error_responses:
+      - name: invalid_replay_cursor
+        status: 400
+        fields:
+          - name: error
+            type: string
+            required: true
+            const: invalid_replay_cursor
+      - name: replay_cursor_expired
+        status: 409
+        fields:
+          - name: error
+            type: string
+            required: true
+            const: replay_cursor_expired
+          - name: oldest_cursor
+            type: string
+            required: false
+      - name: stream_unavailable
+        status: 503
+        fields:
+          - name: error
+            type: string
+            required: true
+            const: stream_unavailable

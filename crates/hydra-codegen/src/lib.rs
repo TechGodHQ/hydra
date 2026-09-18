@@ -9,7 +9,8 @@ use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
 use hydra_core::{
-    ApiDefinition, Delivery, HttpMethod, Operation, Parameter, ParameterLocation, Surface,
+    ApiDefinition, Delivery, HttpErrorResponse, HttpMethod, Operation, Parameter,
+    ParameterLocation, Surface,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -457,6 +458,7 @@ fn generate_http(definition: &ApiDefinition, config: &GenerateConfig) -> String 
     out.push_str("}\n\n");
 
     out.push_str(&generate_sse_surface(definition, config));
+    out.push_str(&generate_http_error_responses(definition));
 
     let unary: Vec<&Operation> = http_operations(definition)
         .filter(|operation| !operation.is_sse())
@@ -650,6 +652,142 @@ fn generate_sse_surface(definition: &ApiDefinition, config: &GenerateConfig) -> 
     out
 }
 
+/// Emit one typed HTTP-error module per operation that declares responses.
+///
+/// The module is deliberately independent of route generation: unary handlers
+/// retain their existing dispatch hook, while SSE keeps its existing runtime
+/// binding hook. A consumer chooses when to return one of these generated
+/// responses before opening a stream or while handling a unary operation.
+fn generate_http_error_responses(definition: &ApiDefinition) -> String {
+    let mut out = String::new();
+    for operation in
+        http_operations(definition).filter(|operation| !operation.http_error_responses.is_empty())
+    {
+        push_http_error_module(&mut out, operation);
+    }
+    out
+}
+
+/// Emit the typed HTTP-error constructors for one declared operation.
+fn push_http_error_module(out: &mut String, operation: &Operation) {
+    let module_name = format!("{}_http_errors", operation.name);
+    push_fmt!(
+        out,
+        "/// Typed HTTP error responses declared for the `{}` operation.\n",
+        operation.name
+    );
+    push_fmt!(out, "pub mod {module_name} {{\n");
+    out.push_str("    use axum::{\n");
+    out.push_str("        http::StatusCode,\n");
+    out.push_str("        response::{IntoResponse, Response},\n");
+    out.push_str("        Json,\n");
+    out.push_str("    };\n");
+    out.push_str("    use serde::Serialize;\n\n");
+
+    for response in &operation.http_error_responses {
+        push_http_error_response(out, response);
+    }
+
+    out.push_str("}\n\n");
+}
+
+/// Emit one declared typed HTTP response, with private body/status state and a
+/// public constructor returning an `IntoResponse` implementation.
+fn push_http_error_response(out: &mut String, response: &HttpErrorResponse) {
+    let symbol = pascal_case(&response.name);
+    let body_type = format!("{symbol}Body");
+    let response_type = format!("{symbol}Response");
+
+    out.push_str("    #[derive(Serialize)]\n");
+    push_fmt!(out, "    struct {body_type} {{\n");
+    for field in &response.fields {
+        if !field.required {
+            out.push_str("        #[serde(skip_serializing_if = \"Option::is_none\")]\n");
+        }
+        push_fmt!(
+            out,
+            "        {}: {},\n",
+            field.name,
+            http_error_field_type(field)
+        );
+    }
+    out.push_str("    }\n\n");
+
+    push_fmt!(
+        out,
+        "    /// Typed HTTP response for the declared `{}` error.\n",
+        response.name
+    );
+    push_fmt!(out, "    pub struct {response_type} {{\n");
+    out.push_str("        body: ");
+    out.push_str(&body_type);
+    out.push_str(",\n");
+    out.push_str("    }\n\n");
+
+    push_fmt!(out, "    impl IntoResponse for {response_type} {{\n");
+    out.push_str("        fn into_response(self) -> Response {\n");
+    push_fmt!(
+        out,
+        "            (StatusCode::from_u16({}).expect(\"validated HTTP error status\"), Json(self.body)).into_response()\n",
+        response.status
+    );
+    out.push_str("        }\n");
+    out.push_str("    }\n\n");
+
+    push_fmt!(
+        out,
+        "    /// Construct the declared {} `{}` HTTP response.\n",
+        response.status,
+        response.name
+    );
+    out.push_str("    pub fn ");
+    out.push_str(&response.name);
+    out.push('(');
+    let mut first = true;
+    for field in response
+        .fields
+        .iter()
+        .filter(|field| field.constant.is_none())
+    {
+        if !first {
+            out.push_str(", ");
+        }
+        first = false;
+        push_fmt!(out, "{}: {}", field.name, http_error_field_type(field));
+    }
+    out.push_str(") -> ");
+    out.push_str(&response_type);
+    out.push_str(" {\n");
+    out.push_str("        ");
+    out.push_str(&response_type);
+    out.push_str(" {\n");
+    out.push_str("            body: ");
+    out.push_str(&body_type);
+    out.push_str(" {\n");
+    for field in &response.fields {
+        out.push_str("                ");
+        out.push_str(&field.name);
+        if let Some(constant) = &field.constant {
+            out.push_str(": ");
+            out.push_str(&rust_string_literal(constant));
+            out.push_str(".to_owned()");
+        }
+        out.push_str(",\n");
+    }
+    out.push_str("            },\n");
+    out.push_str("        }\n");
+    out.push_str("    }\n\n");
+}
+
+/// Return the emitted Rust field type for the closed v1 error-field model.
+const fn http_error_field_type(field: &hydra_core::HttpErrorField) -> &'static str {
+    if field.required {
+        "String"
+    } else {
+        "Option<String>"
+    }
+}
+
 /// Emit the `GeneratedRawOperationInput` struct, present only when the
 /// definition contains raw-request operations.
 ///
@@ -793,7 +931,11 @@ fn compare_file(path: impl AsRef<Path>, expected: &str) -> Result<()> {
 }
 
 fn rust_string_literal(value: &str) -> String {
-    serde_json::to_string(value).expect("string literal serialization cannot fail")
+    // `Debug` for `str` emits a Rust string literal, including Rust's
+    // `\u{...}` form for control characters. JSON's `\u0001` form cannot be
+    // inserted directly into generated Rust source because Rust rejects that
+    // escape spelling.
+    format!("{value:?}")
 }
 
 fn cli_variant_name(operation: &Operation) -> String {
