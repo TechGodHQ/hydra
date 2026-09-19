@@ -926,6 +926,43 @@ fn output_flags_compile_and_parse_as_boolean_presentation_options() {
 }
 
 #[test]
+fn output_flags_render_declared_help_from_compiled_cli() {
+    let list_records_help = FixtureCli::try_parse_from(["fixture", "list-records", "--help"])
+        .expect_err("list-records help exits through clap");
+    assert_eq!(
+        list_records_help.kind(),
+        clap::error::ErrorKind::DisplayHelp,
+        "list-records --help must render help"
+    );
+    let list_records_help = list_records_help.render().to_string();
+    assert!(
+        list_records_help.contains("--include-cursor"),
+        "list-records help must expose the exact output flag: {list_records_help}"
+    );
+    assert!(
+        list_records_help.contains("Include the checkpoint alongside each displayed record"),
+        "list-records help must expose the declared output-flag description: {list_records_help}"
+    );
+
+    let status_help = FixtureCli::try_parse_from(["fixture", "status", "--help"])
+        .expect_err("status help exits through clap");
+    assert_eq!(
+        status_help.kind(),
+        clap::error::ErrorKind::DisplayHelp,
+        "status --help must render help"
+    );
+    let status_help = status_help.render().to_string();
+    assert!(
+        status_help.contains("--verbose"),
+        "status help must expose the exact output flag: {status_help}"
+    );
+    assert!(
+        status_help.contains("Include verbose status presentation details"),
+        "status help must expose the declared output-flag description: {status_help}"
+    );
+}
+
+#[test]
 fn output_flags_stay_out_of_request_and_mcp_projections() {
     let definition = cli_output_flags_definition();
     let with_output_flags = generate_all(&definition, &GenerateConfig::default());
