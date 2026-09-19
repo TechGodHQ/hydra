@@ -1,7 +1,7 @@
 //! Ported from iris-codegen's test suite, extended for hydra's config knob
 //! and location metadata.
 
-use std::{collections::BTreeMap, fs};
+use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use axum::{
     Router,
@@ -1405,6 +1405,146 @@ fn http_error_response_fixture_is_fresh_and_byte_deterministic() {
         generate_all(&no_error_definition, &no_error_config).http_rs,
         include_str!("fixtures/notes-pre-raw-http.rs")
     );
+}
+
+fn write_http_error_response_loader_fixture(
+    temp: &tempfile::TempDir,
+    name: &str,
+    yaml: &str,
+) -> PathBuf {
+    let path = temp.path().join(format!("{name}.yaml"));
+    fs::write(&path, yaml).expect("write temporary HTTP-error loader fixture");
+    path
+}
+
+fn http_error_response_fixture_with_required_constant(constant: &str) -> String {
+    include_str!("fixtures/http-error-responses/operations.yaml").replacen(
+        "            const: \"rate \\u0001 \\\"limited\\\"\"",
+        &format!("            const: {constant}"),
+        1,
+    )
+}
+
+fn http_error_response_fixture_with_optional_constant(constant: &str) -> String {
+    const OPTIONAL_RETRY_HINT: &str =
+        "          - name: retry_hint\n            type: string\n            required: false\n";
+
+    include_str!("fixtures/http-error-responses/operations.yaml").replacen(
+        OPTIONAL_RETRY_HINT,
+        &format!("{OPTIONAL_RETRY_HINT}            const: {constant}\n"),
+        1,
+    )
+}
+
+#[test]
+fn http_error_constant_loader_distinguishes_omission_from_explicit_non_strings() {
+    let temp = tempfile::tempdir().expect("temporary loader fixture directory");
+
+    // The committed fixture exercises escaped required strings, plus omitted
+    // required and optional constants through the real YAML loader.
+    let committed_fixture = write_http_error_response_loader_fixture(
+        &temp,
+        "committed",
+        include_str!("fixtures/http-error-responses/operations.yaml"),
+    );
+    let definition = hydra_core::load_api_definition(&committed_fixture)
+        .expect("committed HTTP-error fixture loads through the real boundary");
+    let fields = &definition.operations[0].http_error_responses[0].fields;
+    assert_eq!(
+        fields[0].constant.as_deref(),
+        Some("rate \u{0001} \"limited\"")
+    );
+    assert!(
+        fields[1].constant.is_none(),
+        "omitted required const is dynamic"
+    );
+    assert!(
+        fields[2].constant.is_none(),
+        "omitted optional const is dynamic"
+    );
+    assert!(generate_all(&definition, &http_error_responses_config()).http_rs.contains(
+        "pub fn rate_limited(retry_after: String, retry_hint: Option<String>) -> RateLimitedResponse"
+    ));
+
+    // Quoted scalar text is valid declaration data, including empty strings;
+    // it remains fixed rather than becoming a generated constructor argument.
+    for (name, declaration, expected) in [
+        ("empty-string", "\"\"", ""),
+        ("quoted-numeric", "\"42\"", "42"),
+        ("quoted-boolean", "\"true\"", "true"),
+    ] {
+        let fixture = write_http_error_response_loader_fixture(
+            &temp,
+            name,
+            &http_error_response_fixture_with_required_constant(declaration),
+        );
+        let definition = hydra_core::load_api_definition(&fixture)
+            .unwrap_or_else(|error| panic!("{name} string constant must load: {error:#}"));
+        assert_eq!(
+            definition.operations[0].http_error_responses[0].fields[0]
+                .constant
+                .as_deref(),
+            Some(expected)
+        );
+        assert!(generate_all(&definition, &http_error_responses_config()).http_rs.contains(
+            "pub fn rate_limited(retry_after: String, retry_hint: Option<String>) -> RateLimitedResponse"
+        ));
+    }
+
+    // Every supplied non-string form must stop at load_api_definition before
+    // generation, for both required and optional fields.
+    for (scope, field_name) in [("required", "error"), ("optional", "retry_hint")] {
+        for (name, declaration) in [
+            ("null", "null"),
+            ("tilde", "~"),
+            ("empty-value", ""),
+            ("boolean", "true"),
+            ("integer", "42"),
+            ("float", "4.2"),
+            ("sequence", "[unexpected]"),
+            ("mapping", "{unexpected: value}"),
+        ] {
+            let yaml = match scope {
+                "required" => http_error_response_fixture_with_required_constant(declaration),
+                "optional" => http_error_response_fixture_with_optional_constant(declaration),
+                _ => unreachable!("test scope is fixed"),
+            };
+            let fixture =
+                write_http_error_response_loader_fixture(&temp, &format!("{scope}-{name}"), &yaml);
+            let error = hydra_core::load_api_definition(&fixture).unwrap_err();
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains(&fixture.display().to_string()),
+                "{scope}/{name} error must identify the definition source: {rendered}"
+            );
+            assert!(
+                rendered.contains("const must be a string when supplied"),
+                "{scope}/{name} error must identify const: {rendered}"
+            );
+            assert!(
+                rendered.contains(&format!(
+                    "operation read_events HTTP error response rate_limited field {field_name}"
+                )),
+                "{scope}/{name} error must identify the operation, response, and field: {rendered}"
+            );
+        }
+    }
+
+    let optional_string = write_http_error_response_loader_fixture(
+        &temp,
+        "optional-string",
+        &http_error_response_fixture_with_optional_constant("fixed"),
+    );
+    let error = hydra_core::load_api_definition(&optional_string)
+        .expect_err("optional string constants remain invalid by contract");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains(&optional_string.display().to_string()),
+        "optional string error must identify the definition source: {rendered}"
+    );
+    assert!(rendered.contains(
+        "operation read_events HTTP error response rate_limited field retry_hint declares const but is optional"
+    ));
 }
 
 #[test]
