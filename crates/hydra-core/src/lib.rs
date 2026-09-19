@@ -14,7 +14,7 @@
 use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as DeError};
 
 pub mod paths;
 pub mod validate;
@@ -309,8 +309,32 @@ pub struct HttpErrorField {
     ///
     /// Constants are permitted only for required fields, so optional fields
     /// retain their `Option<String>` omission semantics.
-    #[serde(rename = "const", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "const",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_http_error_constant"
+    )]
     pub constant: Option<String>,
+}
+
+/// Deserialize a declared HTTP-error constant without collapsing an explicit
+/// YAML null into an omitted declaration.
+///
+/// `default` supplies `None` only when the `const` key is absent. A supplied
+/// key must deserialize as a string, so YAML null and every non-string node
+/// fail at the definition-loader boundary rather than becoming a dynamic
+/// generated constructor argument.
+fn deserialize_http_error_constant<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match serde_yaml::Value::deserialize(deserializer)? {
+        serde_yaml::Value::String(value) => Ok(Some(value)),
+        _ => Err(D::Error::custom(
+            "HTTP error field const must be a string when supplied",
+        )),
+    }
 }
 
 /// Field types supported by typed HTTP error responses.
@@ -390,8 +414,91 @@ pub fn load_api_definition(path: impl AsRef<Path>) -> Result<ApiDefinition> {
     let path = path.as_ref();
     let raw = fs::read_to_string(path)
         .with_context(|| format!("read API definition from {}", path.display()))?;
+    let raw_definition: serde_yaml::Value = serde_yaml::from_str(&raw)
+        .with_context(|| format!("parse API definition from {}", path.display()))?;
+    validate_http_error_constant_declarations(&raw_definition)
+        .with_context(|| format!("validate HTTP error constants in {}", path.display()))?;
     let definition: ApiDefinition = serde_yaml::from_str(&raw)
         .with_context(|| format!("parse API definition from {}", path.display()))?;
-    validate::validate_definition(&definition)?;
+    validate::validate_definition(&definition)
+        .with_context(|| format!("validate API definition from {}", path.display()))?;
     Ok(definition)
+}
+
+/// Reject supplied non-string HTTP-error constants with declaration names.
+///
+/// The public model intentionally keeps `constant` as `Option<String>` for
+/// programmatic construction. Inspecting the raw YAML before typed
+/// deserialization preserves the otherwise-lost distinction between an absent
+/// key and an explicit YAML null while giving users named operation, response,
+/// and field diagnostics.
+fn validate_http_error_constant_declarations(definition: &serde_yaml::Value) -> Result<()> {
+    let Some(root) = definition.as_mapping() else {
+        return Ok(());
+    };
+    let Some(operations) =
+        yaml_mapping_value(root, "operations").and_then(serde_yaml::Value::as_sequence)
+    else {
+        return Ok(());
+    };
+
+    for (operation_index, operation) in operations.iter().enumerate() {
+        let Some(operation) = operation.as_mapping() else {
+            continue;
+        };
+        let operation_name = yaml_mapping_value(operation, "name")
+            .and_then(serde_yaml::Value::as_str)
+            .map_or_else(
+                || format!("operations[{operation_index}]"),
+                ToOwned::to_owned,
+            );
+        let Some(responses) = yaml_mapping_value(operation, "http_error_responses")
+            .and_then(serde_yaml::Value::as_sequence)
+        else {
+            continue;
+        };
+
+        for (response_index, response) in responses.iter().enumerate() {
+            let Some(response) = response.as_mapping() else {
+                continue;
+            };
+            let response_name = yaml_mapping_value(response, "name")
+                .and_then(serde_yaml::Value::as_str)
+                .map_or_else(
+                    || format!("http_error_responses[{response_index}]"),
+                    ToOwned::to_owned,
+                );
+            let Some(fields) =
+                yaml_mapping_value(response, "fields").and_then(serde_yaml::Value::as_sequence)
+            else {
+                continue;
+            };
+
+            for (field_index, field) in fields.iter().enumerate() {
+                let Some(field) = field.as_mapping() else {
+                    continue;
+                };
+                let field_name = yaml_mapping_value(field, "name")
+                    .and_then(serde_yaml::Value::as_str)
+                    .map_or_else(|| format!("fields[{field_index}]"), ToOwned::to_owned);
+                if let Some(constant) = yaml_mapping_value(field, "const")
+                    && !matches!(constant, serde_yaml::Value::String(_))
+                {
+                    anyhow::bail!(
+                        "operation {operation_name} HTTP error response {response_name} field {field_name} declares const with a non-string value; const must be a string when supplied"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Look up a string key in a YAML mapping without coercing YAML values.
+fn yaml_mapping_value<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    key: &str,
+) -> Option<&'a serde_yaml::Value> {
+    mapping.get(serde_yaml::Value::String(key.to_owned()))
 }
