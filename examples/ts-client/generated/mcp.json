@@ -1,0 +1,242 @@
+{
+  "locations": {
+    "audit_query": {
+      "action": "query",
+      "limit": "query",
+      "provider": "query",
+      "since": "query",
+      "source_id": "query",
+      "until": "query"
+    },
+    "ingest_batch": {
+      "batch": "body"
+    },
+    "list_contacts": {
+      "cursor": "query",
+      "limit": "query"
+    },
+    "list_messages": {
+      "before": "query",
+      "limit": "query",
+      "thread_id": "path"
+    },
+    "list_threads": {
+      "cursor": "query",
+      "limit": "query"
+    },
+    "send_message": {
+      "attachments": "body",
+      "body": "body",
+      "provider": "body",
+      "thread_id": "path"
+    }
+  },
+  "tools": [
+    {
+      "description": "List normalized messages in a thread.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "before": {
+            "description": "Return messages older than this timestamp cursor.",
+            "type": "string"
+          },
+          "limit": {
+            "description": "Maximum number of messages to return.",
+            "type": "integer"
+          },
+          "thread_id": {
+            "description": "Thread ID to list messages from.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id"
+        ],
+        "type": "object"
+      },
+      "name": "list_messages"
+    },
+    {
+      "description": "List conversation threads across configured provider instances. Each result includes `provider_instance`, the exact configured instance that owns it.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "description": "Cursor; use RFC3339 timestamp or `<RFC3339>|<source>|<thread_uuid>` to avoid skipping timestamp ties.",
+            "type": "string"
+          },
+          "limit": {
+            "description": "Maximum number of threads to return.",
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "list_threads"
+    },
+    {
+      "description": "List contacts across configured provider instances. Each result includes `provider_instance`, the exact configured instance that owns it.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "description": "Contact ID cursor; returns contacts after this ID in deterministic sort order.",
+            "type": "string"
+          },
+          "limit": {
+            "description": "Maximum number of contacts to return.",
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "list_contacts"
+    },
+    {
+      "description": "Send a message to a thread through the owning provider.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "attachments": {
+            "description": "Attachments to send; each item is inline bytes (`mime_type` + `data_base64`, optional `filename`) or a stored `iris://attachment` reference (`stored_id`).",
+            "items": {
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "data_base64": {
+                      "type": "string"
+                    },
+                    "filename": {
+                      "type": "string"
+                    },
+                    "mime_type": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "mime_type",
+                    "data_base64"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "stored_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "stored_id"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "type": "array"
+          },
+          "body": {
+            "description": "Message body to send.",
+            "type": "string"
+          },
+          "provider": {
+            "description": "Configured provider instance ID to route the send through when ownership is ambiguous. Discover exact IDs via `GET /providers`; an explicit instance is authoritative.",
+            "type": "string"
+          },
+          "thread_id": {
+            "description": "Thread ID to send the message to.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id",
+          "body"
+        ],
+        "type": "object"
+      },
+      "name": "send_message"
+    },
+    {
+      "description": "Query tamper-evident provider audit events.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "Include only this action (`normalize`, `send`, or `fetch_attachment`).",
+            "type": "string"
+          },
+          "limit": {
+            "description": "Maximum number of entries to return.",
+            "type": "integer"
+          },
+          "provider": {
+            "description": "Include only events emitted by this provider.",
+            "type": "string"
+          },
+          "since": {
+            "description": "Include entries at or after this RFC3339 timestamp.",
+            "type": "string"
+          },
+          "source_id": {
+            "description": "Include only this provider-specific source ID.",
+            "type": "string"
+          },
+          "until": {
+            "description": "Include entries at or before this RFC3339 timestamp.",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "audit_query"
+    },
+    {
+      "description": "Transactionally ingest a normalized, replayable source batch.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "batch": {
+            "additionalProperties": false,
+            "description": "Serialized normalized `IngestBatch`. The server computes its canonical hash; `batch_hash` is forbidden.",
+            "properties": {
+              "audit": {
+                "type": "object"
+              },
+              "cursor": {
+                "type": "object"
+              },
+              "mutations": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "replay_key": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "source",
+              "replay_key",
+              "mutations"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "batch"
+        ],
+        "type": "object"
+      },
+      "name": "ingest_batch"
+    }
+  ]
+}

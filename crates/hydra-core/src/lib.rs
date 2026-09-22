@@ -2,8 +2,9 @@
 //! generated surfaces.
 //!
 //! An [`ApiDefinition`] is the single source of truth for a project's
-//! operations. Hydra projects it onto three surfaces — CLI (clap), HTTP
-//! (axum), and MCP (tool schemas + stdio runtime) — without name-based
+//! operations. Hydra projects it onto four surfaces — CLI (clap), HTTP
+//! (axum), MCP (tool schemas + stdio runtime), and a fetch-based TypeScript
+//! client — without name-based
 //! inference: every route, parameter location, and surface allowlist is
 //! declared explicitly, so the generated contract cannot drift from the
 //! generated router.
@@ -130,7 +131,7 @@ pub enum Delivery {
 
 /// A generated surface an operation may be exposed on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Surface {
     /// The HTTP REST surface.
     Http,
@@ -138,6 +139,8 @@ pub enum Surface {
     Cli,
     /// The MCP tool surface.
     Mcp,
+    /// The fetch-based TypeScript client surface.
+    TsClient,
 }
 
 impl Operation {
@@ -176,6 +179,17 @@ impl Operation {
         self.surfaces
             .as_ref()
             .is_none_or(|surfaces| surfaces.contains(&Surface::Mcp))
+    }
+
+    /// Whether the TypeScript client surface is generated for this operation.
+    /// Unary operations with no explicit allowlist opt in by default; SSE
+    /// operations stay out until a streaming TypeScript contract exists.
+    #[must_use]
+    pub fn generates_ts_client(&self) -> bool {
+        self.surfaces.as_ref().map_or_else(
+            || !self.is_sse(),
+            |surfaces| surfaces.contains(&Surface::TsClient),
+        )
     }
 }
 

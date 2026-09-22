@@ -110,6 +110,7 @@ fn context_page_definition() -> ApiDefinition {
                 hydra_core::Surface::Cli,
                 hydra_core::Surface::Http,
                 hydra_core::Surface::Mcp,
+                hydra_core::Surface::TsClient,
             ]),
             cli_command: None,
             cli_output_flags: vec![],
@@ -148,7 +149,7 @@ fn sample_definition() -> ApiDefinition {
 }
 
 #[test]
-fn generates_all_three_surfaces_from_definition() {
+fn generates_all_four_surfaces_from_definition() {
     let artifacts = generate_all(&sample_definition(), &GenerateConfig::default());
     assert!(artifacts.cli_rs.contains("ListItems(ListItemsArgs)"));
     assert!(
@@ -157,6 +158,8 @@ fn generates_all_three_surfaces_from_definition() {
             .contains(".route(\"/items\", get(list_items))")
     );
     assert!(artifacts.mcp_json.contains("\"list_items\""));
+    assert!(artifacts.ts_client_ts.contains("export class HydraClient"));
+    assert!(artifacts.ts_client_ts.contains("async listItems"));
 }
 
 #[test]
@@ -196,6 +199,7 @@ fn adding_operation_changes_every_surface() {
     assert_ne!(before.cli_rs, after.cli_rs);
     assert_ne!(before.http_rs, after.http_rs);
     assert_ne!(before.mcp_json, after.mcp_json);
+    assert_ne!(before.ts_client_ts, after.ts_client_ts);
 }
 
 #[test]
@@ -207,6 +211,7 @@ fn surface_allowlist_hides_operations_per_surface() {
     assert!(!artifacts.cli_rs.contains("ListItems"), "CLI must be empty");
     assert!(artifacts.http_rs.contains("list_items"));
     assert!(artifacts.mcp_json.contains("list_items"));
+    assert!(!artifacts.ts_client_ts.contains("listItems"));
 }
 
 #[test]
@@ -231,6 +236,7 @@ fn sse_operations_are_excluded_from_mcp_and_unary_routes() {
     assert!(!artifacts.mcp_json.contains("subscribe_events"));
     assert!(!artifacts.http_rs.contains("async fn subscribe_events("));
     assert!(artifacts.http_rs.contains("bind_subscribe_events"));
+    assert!(!artifacts.ts_client_ts.contains("subscribeEvents"));
     // CLI command override flows through
     assert!(artifacts.cli_rs.contains("Watch(WatchArgs)"));
 }
@@ -293,6 +299,162 @@ fn unary_cursor_pagination_projects_deterministically_across_surfaces() {
     assert_eq!(
         mcp["locations"]["get_context_page"]["cursor"],
         serde_json::json!("query")
+    );
+    assert!(
+        first
+            .ts_client_ts
+            .contains("export interface GetContextPageParams")
+    );
+    assert!(first.ts_client_ts.contains("async getContextPage"));
+    assert!(
+        first
+            .ts_client_ts
+            .contains("url.searchParams.set(\"cursor\"")
+    );
+}
+
+#[test]
+fn typescript_client_projects_path_body_schema_and_auth_explicitly() {
+    let mut definition = definition_with_attachments();
+    definition.operations[0].method = HttpMethod::Post;
+    definition.operations[0].read = false;
+    definition.operations[0].path = "/items/{item_id}/parts/{part_id}".into();
+    definition.operations[0].parameters.push(Parameter {
+        name: "item_id".into(),
+        description: "Item ID.".into(),
+        ty: hydra_core::ParameterType::String,
+        required: true,
+        location: ParameterLocation::Path,
+        schema: None,
+        cli: None,
+    });
+    definition.operations[0].parameters.push(Parameter {
+        name: "part_id".into(),
+        description: "Part ID.".into(),
+        ty: hydra_core::ParameterType::String,
+        required: true,
+        location: ParameterLocation::Path,
+        schema: None,
+        cli: None,
+    });
+    let config = GenerateConfig {
+        ts_client_name: "NotesClient".into(),
+        ..GenerateConfig::default()
+    };
+    let artifacts = generate_all(&definition, &config);
+    assert!(artifacts.ts_client_ts.contains("export class NotesClient"));
+    assert!(
+        artifacts
+            .ts_client_ts
+            .contains("encodeURIComponent(String(params.item_id))")
+    );
+    assert!(
+        artifacts
+            .ts_client_ts
+            .contains("encodeURIComponent(String(params.part_id))")
+    );
+    assert!(artifacts.ts_client_ts.contains("attachments?: Array<{"));
+    assert!(artifacts.ts_client_ts.contains("mime_type: string"));
+    assert!(
+        artifacts
+            .ts_client_ts
+            .contains("headers.set(\"authorization\", `Bearer ${this.token}`)")
+    );
+    assert!(artifacts.ts_client_ts.contains("body: JSON.stringify({"));
+}
+
+#[test]
+fn typescript_surface_can_be_selected_without_other_surfaces() {
+    let mut definition = sample_definition();
+    definition.operations[0].surfaces = Some(vec![hydra_core::Surface::TsClient]);
+    let artifacts = generate_all(&definition, &GenerateConfig::default());
+    assert!(artifacts.ts_client_ts.contains("listItems"));
+    assert!(!artifacts.cli_rs.contains("ListItems"));
+    assert!(!artifacts.http_rs.contains("list_items"));
+    assert!(!artifacts.mcp_json.contains("list_items"));
+}
+
+#[test]
+fn typescript_output_option_uses_json_nullability() {
+    let mut definition = sample_definition();
+    definition.operations[0].output_type = "Option<Item>".into();
+    let artifacts = generate_all(&definition, &GenerateConfig::default());
+    assert!(
+        artifacts
+            .ts_client_ts
+            .contains("export type ListItemsResult = Item | null;")
+    );
+}
+
+#[test]
+fn typescript_json_schema_preserves_standard_null_union() {
+    let mut definition = definition_with_attachments();
+    definition.operations[0].parameters[1].schema = Some(serde_json::json!({
+        "type": ["string", "null"]
+    }));
+    let artifacts = generate_all(&definition, &GenerateConfig::default());
+    assert!(
+        artifacts
+            .ts_client_ts
+            .contains("attachments?: string | null;")
+    );
+}
+
+#[test]
+fn typescript_generation_rejects_config_and_output_name_collisions() {
+    let invalid_config = GenerateConfig {
+        ts_client_name: "class".into(),
+        ..GenerateConfig::default()
+    };
+    assert!(invalid_config.validate().is_err());
+
+    let mut definition = sample_definition();
+    definition.operations[0].output_type = "ListItemsParams".into();
+    let error = hydra_core::validate::validate_definition(&definition)
+        .expect_err("output models must not shadow generated parameter types");
+    assert!(
+        error
+            .to_string()
+            .contains("collides with a generated TypeScript identifier")
+    );
+}
+
+#[test]
+fn rejects_sse_operations_on_typescript_surface_until_stream_contract_exists() {
+    let mut definition = sample_definition();
+    definition.operations[0].delivery = Delivery::Sse;
+    definition.operations[0].surfaces = Some(vec![
+        hydra_core::Surface::Http,
+        hydra_core::Surface::TsClient,
+    ]);
+    let error = hydra_core::validate::validate_definition(&definition)
+        .expect_err("SSE TypeScript projection must be explicitly unsupported");
+    assert!(error.to_string().contains("streaming TypeScript output"));
+}
+
+#[test]
+fn rejects_typescript_method_and_type_collisions_before_generation() {
+    let mut definition = sample_definition();
+    definition.operations[0].name = "list_items".into();
+    let mut colliding = definition.operations[0].clone();
+    colliding.name = "list__items".into();
+    definition.operations.push(colliding);
+    let error = hydra_core::validate::validate_definition(&definition)
+        .expect_err("double underscores must not collapse to one TypeScript method");
+    assert!(
+        error
+            .to_string()
+            .contains("colliding TypeScript client methods")
+    );
+
+    let mut reserved = sample_definition();
+    reserved.operations[0].name = "request".into();
+    let error = hydra_core::validate::validate_definition(&reserved)
+        .expect_err("client helper names must be reserved");
+    assert!(
+        error
+            .to_string()
+            .contains("reserved TypeScript client method")
     );
 }
 
