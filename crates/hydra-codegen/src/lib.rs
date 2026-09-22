@@ -1,8 +1,9 @@
-//! Hydra code generator: projects an [`ApiDefinition`] onto three committed
-//! artifacts — CLI structs (clap), HTTP routes (axum), and MCP tool schemas
-//! (JSON) — from one explicit source of truth. No name-based inference: the
-//! definition declares method, path, parameter locations, and surface
-//! allowlists, and all three surfaces emit from that single declaration.
+//! Hydra code generator: projects an [`ApiDefinition`] onto four committed
+//! artifacts — CLI structs (clap), HTTP routes (axum), MCP tool schemas
+//! (JSON), and a fetch-based TypeScript client — from one explicit source of
+//! truth. No name-based inference: the definition declares method, path,
+//! parameter locations, and surface allowlists, and every surface emits from
+//! that single declaration.
 
 use std::fmt::Write as _;
 use std::{fs, path::Path};
@@ -43,6 +44,9 @@ pub struct GenerateConfig {
     /// Header line identifying the generator in committed artifacts.
     #[serde(default = "default_generator_name")]
     pub generator_name: String,
+    /// Exported class name for the generated TypeScript client.
+    #[serde(default = "default_ts_client_name")]
+    pub ts_client_name: String,
 }
 
 fn default_sse_binding_prefix() -> String {
@@ -57,6 +61,10 @@ fn default_generator_name() -> String {
     "hydra".to_string()
 }
 
+fn default_ts_client_name() -> String {
+    "HydraClient".to_string()
+}
+
 impl Default for GenerateConfig {
     fn default() -> Self {
         Self {
@@ -65,7 +73,32 @@ impl Default for GenerateConfig {
             sse_binding_prefix: default_sse_binding_prefix(),
             http_raw_dispatch_fn: default_http_raw_dispatch_fn(),
             generator_name: default_generator_name(),
+            ts_client_name: default_ts_client_name(),
         }
+    }
+}
+
+impl GenerateConfig {
+    /// Validate configuration that affects generated TypeScript identifiers.
+    ///
+    /// Rust dispatch paths remain consumer-owned strings, but the exported
+    /// client class is emitted directly into TypeScript and must be a safe,
+    /// non-reserved identifier that cannot shadow the shared generated types.
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            is_ts_identifier(&self.ts_client_name),
+            "ts_client_name must be a non-reserved TypeScript identifier: {}",
+            self.ts_client_name
+        );
+        anyhow::ensure!(
+            !matches!(
+                self.ts_client_name.as_str(),
+                "ClientOptions" | "ApiError" | "JsonValue"
+            ),
+            "ts_client_name collides with a generated TypeScript type: {}",
+            self.ts_client_name
+        );
+        Ok(())
     }
 }
 
@@ -76,7 +109,18 @@ pub fn generate_all(definition: &ApiDefinition, config: &GenerateConfig) -> Gene
         cli_rs: generate_cli(definition),
         http_rs: generate_http(definition, config),
         mcp_json: generate_mcp(definition),
+        ts_client_ts: generate_ts_client(definition, config),
     }
+}
+
+/// Validate cross-definition/configuration collisions before generating
+/// TypeScript identifiers.
+///
+/// CLI callers should run this before `write` or `check` so invalid
+/// combinations produce structured errors rather than reaching the generator's
+/// defensive assertion.
+pub fn validate_generation(definition: &ApiDefinition, config: &GenerateConfig) -> Result<()> {
+    validate_ts_client_generation(definition, config)
 }
 
 /// Generated artifact bundle.
@@ -88,6 +132,8 @@ pub struct GeneratedArtifacts {
     pub http_rs: String,
     /// Generated MCP tool schema JSON.
     pub mcp_json: String,
+    /// Generated fetch-based TypeScript client module.
+    pub ts_client_ts: String,
 }
 
 /// Write generated artifacts under a directory.
@@ -97,6 +143,9 @@ pub fn write_generated(dir: impl AsRef<Path>, artifacts: &GeneratedArtifacts) ->
     write_if_changed(dir.join("cli.rs"), &artifacts.cli_rs)?;
     write_if_changed(dir.join("http.rs"), &artifacts.http_rs)?;
     write_if_changed(dir.join("mcp.json"), &artifacts.mcp_json)?;
+    let ts_dir = dir.join("ts-client");
+    fs::create_dir_all(&ts_dir).with_context(|| format!("create {}", ts_dir.display()))?;
+    write_if_changed(ts_dir.join("index.ts"), &artifacts.ts_client_ts)?;
     Ok(())
 }
 
@@ -107,12 +156,18 @@ pub fn verify_generated(
     config: &GenerateConfig,
 ) -> Result<()> {
     let definition = hydra_core::load_api_definition(definition_path)?;
+    validate_generation(&definition, config)
+        .context("validate generated TypeScript identifiers")?;
     let expected = generate_all(&definition, config);
     let dir = generated_dir.as_ref();
 
     compare_file(dir.join("cli.rs"), &expected.cli_rs)?;
     compare_file(dir.join("http.rs"), &expected.http_rs)?;
     compare_file(dir.join("mcp.json"), &expected.mcp_json)?;
+    compare_file(
+        dir.join("ts-client").join("index.ts"),
+        &expected.ts_client_ts,
+    )?;
     Ok(())
 }
 
@@ -211,6 +266,9 @@ fn generate_cli(definition: &ApiDefinition) -> String {
         out.push_str("}\n\n");
     }
 
+    if out.ends_with("\n\n") {
+        out.pop();
+    }
     out
 }
 
@@ -896,6 +954,630 @@ fn generate_mcp(definition: &ApiDefinition) -> String {
     out
 }
 
+// ── TypeScript client surface ──────────────────────────────────────────────
+
+/// Generate a zero-runtime-dependency, fetch-based TypeScript client.
+///
+/// The client intentionally keeps the operation definition visible in the
+/// emitted code: path/query/body placement comes from the declared parameter
+/// locations, and the generated method names and wire keys are derived only
+/// from the explicit operation/parameter names. Named output models remain
+/// opaque records because the Hydra definition carries output type names but
+/// not their domain schemas; a consumer can refine those aliases at its own
+/// boundary without making the generator invent fields.
+fn generate_ts_client(definition: &ApiDefinition, config: &GenerateConfig) -> String {
+    assert!(
+        validate_ts_client_generation(definition, config).is_ok(),
+        "invalid TypeScript client generation configuration or identifier collision"
+    );
+    let operations: Vec<&Operation> = definition
+        .operations
+        .iter()
+        .filter(|operation| operation.generates_ts_client() && !operation.is_sse())
+        .collect();
+    let mut out = generated_header("TypeScript fetch client generated from the API definition");
+    out.push_str("/*\n");
+    out.push_str(" * Runtime dependencies: none. This module uses the platform fetch API.\n");
+    out.push_str(" * i64/i32-like values are represented as number; consumers that need\n");
+    out.push_str(" * exact 64-bit integer precision must validate or replace that alias.\n");
+    out.push_str(" */\n\n");
+    out.push_str("export type JsonValue =\n");
+    out.push_str("  | null\n");
+    out.push_str("  | boolean\n");
+    out.push_str("  | number\n");
+    out.push_str("  | string\n");
+    out.push_str("  | JsonValue[]\n");
+    out.push_str("  | { [key: string]: JsonValue };\n\n");
+
+    let named_types = ts_named_output_types(&operations, &config.ts_client_name);
+    for name in named_types {
+        push_fmt!(
+            out,
+            "/** Opaque domain model `{name}`; refine this alias in the consumer. */\nexport type {name} = Record<string, unknown>;\n\n"
+        );
+    }
+
+    out.push_str("/** Construction options for the generated client. */\n");
+    out.push_str("export interface ClientOptions {\n");
+    out.push_str("  /** Absolute service URL, with an optional path prefix. */\n");
+    out.push_str("  baseUrl: string;\n");
+    out.push_str("  /** Optional deployment-wide bearer token. */\n");
+    out.push_str("  token?: string;\n");
+    out.push_str("  /** Injectable fetch for tests, Node adapters, and custom transports. */\n");
+    out.push_str("  fetch?: typeof globalThis.fetch;\n");
+    out.push_str("}\n\n");
+    out.push_str("/** Structured error returned for a non-2xx HTTP response. */\n");
+    out.push_str("export class ApiError extends Error {\n");
+    out.push_str("  readonly status: number;\n");
+    out.push_str("  readonly body: unknown;\n\n");
+    out.push_str("  constructor(status: number, body: unknown) {\n");
+    out.push_str("    super(`HTTP ${status}`);\n");
+    out.push_str("    this.name = \"ApiError\";\n");
+    out.push_str("    this.status = status;\n");
+    out.push_str("    this.body = body;\n");
+    out.push_str("  }\n");
+    out.push_str("}\n\n");
+
+    for operation in &operations {
+        push_ts_operation_types(&mut out, operation);
+    }
+
+    push_fmt!(
+        out,
+        "/** Typed fetch client for the operations declared by this project. */\nexport class {} {{\n",
+        config.ts_client_name
+    );
+    out.push_str("  private readonly baseUrl: string;\n");
+    out.push_str("  private readonly token?: string;\n");
+    out.push_str("  private readonly fetchImpl: typeof globalThis.fetch;\n\n");
+    out.push_str("  constructor(options: ClientOptions) {\n");
+    out.push_str("    this.baseUrl = options.baseUrl.replace(/\\/+$/, \"\");\n");
+    out.push_str("    this.token = options.token;\n");
+    out.push_str("    this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);\n");
+    out.push_str("  }\n\n");
+
+    for operation in &operations {
+        push_ts_operation_method(&mut out, operation);
+    }
+
+    out.push_str("  private makeUrl(path: string): URL {\n");
+    out.push_str("    return new URL(`${this.baseUrl}${path}`);\n");
+    out.push_str("  }\n\n");
+    out.push_str("  private async request<T>(url: URL, init: RequestInit): Promise<T> {\n");
+    out.push_str("    const headers = new Headers(init.headers);\n");
+    out.push_str("    headers.set(\"accept\", \"application/json\");\n");
+    out.push_str("    if (init.body !== undefined && !headers.has(\"content-type\")) {\n");
+    out.push_str("      headers.set(\"content-type\", \"application/json\");\n");
+    out.push_str("    }\n");
+    out.push_str("    if (this.token !== undefined) {\n");
+    out.push_str("      headers.set(\"authorization\", `Bearer ${this.token}`);\n");
+    out.push_str("    }\n");
+    out.push_str("    const response = await this.fetchImpl(url, { ...init, headers });\n");
+    out.push_str("    const text = await response.text();\n");
+    out.push_str("    let body: unknown = undefined;\n");
+    out.push_str("    if (text.length > 0) {\n");
+    out.push_str("      try {\n");
+    out.push_str("        body = JSON.parse(text) as unknown;\n");
+    out.push_str("      } catch {\n");
+    out.push_str("        body = text;\n");
+    out.push_str("      }\n");
+    out.push_str("    }\n");
+    out.push_str("    if (!response.ok) {\n");
+    out.push_str("      throw new ApiError(response.status, body);\n");
+    out.push_str("    }\n");
+    out.push_str("    return body as T;\n");
+    out.push_str("  }\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Emit the TypeScript input/result aliases for one operation.
+fn push_ts_operation_types(out: &mut String, operation: &Operation) {
+    let prefix = pascal_case(&operation.name);
+    push_fmt!(out, "/** {} */\n", operation.description);
+    push_fmt!(out, "export interface {prefix}Params {{\n");
+    for parameter in &operation.parameters {
+        push_fmt!(
+            out,
+            "  {}{}: {};\n",
+            parameter.name,
+            if parameter.required { "" } else { "?" },
+            ts_parameter_type(parameter)
+        );
+    }
+    out.push_str("}\n\n");
+    push_fmt!(
+        out,
+        "/** Result type declared as `{}`. */\nexport type {prefix}Result = {};\n\n",
+        operation.output_type,
+        ts_output_type(&operation.output_type)
+    );
+}
+
+/// Emit one client method, preserving each parameter's declared wire location.
+fn push_ts_operation_method(out: &mut String, operation: &Operation) {
+    let prefix = pascal_case(&operation.name);
+    let method_name = camel_case(&operation.name);
+    let has_parameters = !operation.parameters.is_empty();
+    let all_optional = operation
+        .parameters
+        .iter()
+        .all(|parameter| !parameter.required);
+    let signature = if !has_parameters {
+        String::new()
+    } else if all_optional {
+        format!("params: {prefix}Params = {{}}")
+    } else {
+        format!("params: {prefix}Params")
+    };
+    push_fmt!(
+        out,
+        "  /** {} */\n  async {method_name}({signature}): Promise<{prefix}Result> {{\n",
+        operation.description
+    );
+    let path_expression = ts_path_expression(operation);
+    push_fmt!(out, "    const url = this.makeUrl({path_expression});\n");
+    for parameter in operation
+        .parameters
+        .iter()
+        .filter(|parameter| parameter.location == ParameterLocation::Query)
+    {
+        push_fmt!(
+            out,
+            "    if (params.{} !== undefined) {{\n      url.searchParams.set({}, String(params.{}));\n    }}\n",
+            parameter.name,
+            ts_string_literal(&parameter.name),
+            parameter.name
+        );
+    }
+    out.push_str("    return this.request(url, {\n");
+    push_fmt!(
+        out,
+        "      method: {},\n",
+        ts_string_literal(operation.method.as_str())
+    );
+    let body_parameters: Vec<&Parameter> = operation
+        .parameters
+        .iter()
+        .filter(|parameter| parameter.location == ParameterLocation::Body)
+        .collect();
+    if !body_parameters.is_empty() {
+        out.push_str("      body: JSON.stringify({\n");
+        for parameter in body_parameters {
+            push_fmt!(
+                out,
+                "        {}: params.{},\n",
+                ts_string_literal(&parameter.name),
+                parameter.name
+            );
+        }
+        out.push_str("      }),\n");
+    }
+    out.push_str("    });\n");
+    out.push_str("  }\n\n");
+}
+
+/// Build a TypeScript expression for a path, encoding every declared path
+/// parameter instead of guessing from a path segment's spelling.
+fn ts_path_expression(operation: &Operation) -> String {
+    let mut expression = String::new();
+    let mut cursor = 0;
+    while let Some(relative_open) = operation.path[cursor..].find('{') {
+        let open = cursor + relative_open;
+        let Some(relative_close) = operation.path[open..].find('}') else {
+            break;
+        };
+        let close = open + relative_close;
+        if open > cursor {
+            expression.push_str(" + ");
+            expression.push_str(&ts_string_literal(&operation.path[cursor..open]));
+        }
+        let name = &operation.path[open + 1..close];
+        expression.push_str(" + encodeURIComponent(String(params.");
+        expression.push_str(name);
+        expression.push_str("))");
+        cursor = close + 1;
+    }
+    if cursor < operation.path.len() {
+        expression.push_str(" + ");
+        expression.push_str(&ts_string_literal(&operation.path[cursor..]));
+    }
+    if expression.is_empty() {
+        ts_string_literal(&operation.path)
+    } else {
+        expression.trim_start_matches(" + ").to_owned()
+    }
+}
+
+/// Convert a declared parameter to a TypeScript type. JSON parameters use
+/// their explicit JSON Schema; no shape is inferred from the parameter name.
+fn ts_parameter_type(parameter: &Parameter) -> String {
+    if parameter.ty == hydra_core::ParameterType::Json {
+        parameter
+            .schema
+            .as_ref()
+            .map_or_else(|| "JsonValue".to_owned(), ts_schema_type)
+    } else {
+        ts_scalar_type(parameter.ty)
+    }
+}
+
+fn ts_scalar_type(parameter_type: hydra_core::ParameterType) -> String {
+    match parameter_type {
+        hydra_core::ParameterType::String => "string".to_owned(),
+        hydra_core::ParameterType::U32 => "number".to_owned(),
+        hydra_core::ParameterType::Bool => "boolean".to_owned(),
+        hydra_core::ParameterType::Json => "JsonValue".to_owned(),
+    }
+}
+
+/// Project the supported JSON Schema subset to a deterministic inline type.
+fn ts_schema_type(schema: &Value) -> String {
+    if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array) {
+        return one_of
+            .iter()
+            .map(ts_schema_type)
+            .collect::<Vec<_>>()
+            .join(" | ");
+    }
+    if let Some(any_of) = schema.get("anyOf").and_then(Value::as_array) {
+        return any_of
+            .iter()
+            .map(ts_schema_type)
+            .collect::<Vec<_>>()
+            .join(" | ");
+    }
+    if let Some(all_of) = schema.get("allOf").and_then(Value::as_array) {
+        return all_of
+            .iter()
+            .map(ts_schema_type)
+            .collect::<Vec<_>>()
+            .join(" & ");
+    }
+    if let Some(value) = schema.get("const") {
+        return ts_json_literal(value);
+    }
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        return values
+            .iter()
+            .map(ts_json_literal)
+            .collect::<Vec<_>>()
+            .join(" | ");
+    }
+    let nullable = schema
+        .get("nullable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || schema
+            .get("type")
+            .and_then(Value::as_array)
+            .is_some_and(|types| types.iter().any(|kind| kind.as_str() == Some("null")));
+    let mut type_name = match schema.get("type") {
+        Some(Value::String(kind)) => ts_schema_kind(schema, kind),
+        Some(Value::Array(kinds)) => kinds
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|kind| *kind != "null")
+            .map(|kind| ts_schema_kind(schema, kind))
+            .collect::<Vec<_>>()
+            .join(" | "),
+        _ => "unknown".to_owned(),
+    };
+    if type_name.is_empty() {
+        "unknown".clone_into(&mut type_name);
+    }
+    if nullable {
+        type_name.push_str(" | null");
+    }
+    type_name
+}
+
+fn ts_schema_kind(schema: &Value, kind: &str) -> String {
+    match kind {
+        "string" => "string".to_owned(),
+        "integer" | "number" => "number".to_owned(),
+        "boolean" => "boolean".to_owned(),
+        "null" => "null".to_owned(),
+        "array" => schema.get("items").map_or_else(
+            || "Array<unknown>".to_owned(),
+            |items| format!("Array<{}>", ts_schema_type(items)),
+        ),
+        "object" => {
+            let mut fields = Vec::new();
+            if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+                let required = schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<std::collections::BTreeSet<_>>()
+                    })
+                    .unwrap_or_default();
+                for (name, property) in properties {
+                    fields.push(format!(
+                        "{}{}: {}",
+                        ts_property_key(name),
+                        if required.contains(name.as_str()) {
+                            ""
+                        } else {
+                            "?"
+                        },
+                        ts_schema_type(property)
+                    ));
+                }
+            }
+            if schema.get("additionalProperties").and_then(Value::as_bool) != Some(false) {
+                fields.push("[key: string]: unknown".to_owned());
+            }
+            format!("{{ {} }}", fields.join("; "))
+        }
+        _ => "unknown".to_owned(),
+    }
+}
+
+/// Map the Rust-ish output type notation currently carried by Hydra's model
+/// to a TypeScript expression without pretending that unknown domain models
+/// have fields the definition never declared.
+fn ts_output_type(output_type: &str) -> String {
+    let output_type = output_type.trim();
+    if let Some(inner) = generic_inner(output_type, "Vec") {
+        return format!("Array<{}>", ts_output_type(inner));
+    }
+    if let Some(inner) = generic_inner(output_type, "Option") {
+        return format!("{} | null", ts_output_type(inner));
+    }
+    if let Some(inner) = generic_inner(output_type, "Result") {
+        return ts_output_type(
+            split_generic_args(inner)
+                .first()
+                .copied()
+                .unwrap_or("unknown"),
+        );
+    }
+    match output_type {
+        "()" => "void".to_owned(),
+        "String" | "str" | "string" => "string".to_owned(),
+        "bool" | "boolean" => "boolean".to_owned(),
+        "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16" | "i32" | "i64" | "i128"
+        | "isize" | "f32" | "f64" | "number" => "number".to_owned(),
+        "Value" | "Json" | "json" | "serde_json::Value" => "JsonValue".to_owned(),
+        value
+            if is_type_identifier(value)
+                && !matches!(value, "ClientOptions" | "ApiError" | "JsonValue") =>
+        {
+            value.to_owned()
+        }
+        _ => "unknown".to_owned(),
+    }
+}
+
+fn ts_named_output_types(operations: &[&Operation], reserved_name: &str) -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for operation in operations {
+        collect_named_output_types(operation.output_type.trim(), &mut names);
+    }
+    names
+        .into_iter()
+        .filter(|name| {
+            name != reserved_name
+                && !matches!(name.as_str(), "ClientOptions" | "ApiError" | "JsonValue")
+        })
+        .collect()
+}
+
+fn validate_ts_client_generation(
+    definition: &ApiDefinition,
+    config: &GenerateConfig,
+) -> Result<()> {
+    config.validate()?;
+    let operations: Vec<&Operation> = definition
+        .operations
+        .iter()
+        .filter(|operation| operation.generates_ts_client() && !operation.is_sse())
+        .collect();
+    let mut generated = std::collections::BTreeSet::from([
+        config.ts_client_name.clone(),
+        "ClientOptions".to_owned(),
+        "ApiError".to_owned(),
+        "JsonValue".to_owned(),
+    ]);
+    for operation in &operations {
+        let method = camel_case(&operation.name);
+        anyhow::ensure!(
+            !matches!(
+                method.as_str(),
+                "constructor" | "baseUrl" | "token" | "fetchImpl" | "makeUrl" | "request"
+            ),
+            "operation {} generates a reserved TypeScript client member {}",
+            operation.name,
+            method
+        );
+        let prefix = pascal_case(&operation.name);
+        for suffix in ["Params", "Result"] {
+            let name = format!("{prefix}{suffix}");
+            anyhow::ensure!(
+                generated.insert(name.clone()),
+                "operation {} collides with generated TypeScript identifier {}",
+                operation.name,
+                name
+            );
+        }
+    }
+
+    let mut model_names = std::collections::BTreeSet::new();
+    for operation in &operations {
+        collect_named_output_types(operation.output_type.trim(), &mut model_names);
+    }
+    for name in model_names {
+        anyhow::ensure!(
+            generated.insert(name.clone()),
+            "output type {name} collides with a generated TypeScript identifier"
+        );
+    }
+    Ok(())
+}
+
+fn collect_named_output_types(output_type: &str, names: &mut std::collections::BTreeSet<String>) {
+    if let Some(inner) = generic_inner(output_type, "Vec") {
+        collect_named_output_types(inner.trim(), names);
+        return;
+    }
+    if let Some(inner) = generic_inner(output_type, "Option") {
+        collect_named_output_types(inner.trim(), names);
+        return;
+    }
+    if let Some(inner) = generic_inner(output_type, "Result") {
+        for argument in split_generic_args(inner) {
+            collect_named_output_types(argument.trim(), names);
+        }
+        return;
+    }
+    if is_type_identifier(output_type)
+        && !matches!(
+            output_type,
+            "String" | "str" | "string" | "bool" | "boolean" | "Value" | "Json" | "json" | "number"
+        )
+    {
+        names.insert(output_type.to_owned());
+    }
+}
+
+fn generic_inner<'a>(value: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}<");
+    value
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix('>'))
+}
+
+fn split_generic_args(value: &str) -> Vec<&str> {
+    let mut args = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+    for (index, character) in value.char_indices() {
+        match character {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => {
+                args.push(value[start..index].trim());
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    args.push(value[start..].trim());
+    args
+}
+
+fn is_type_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        && value
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_uppercase())
+}
+
+fn ts_json_literal(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_owned(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => ts_string_literal(value),
+        _ => "unknown".to_owned(),
+    }
+}
+
+fn ts_property_key(value: &str) -> String {
+    if is_ts_property_identifier(value) {
+        value.to_owned()
+    } else {
+        ts_string_literal(value)
+    }
+}
+
+fn is_ts_property_identifier(value: &str) -> bool {
+    let mut characters = value.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_' || first == '$')
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '$'
+        })
+}
+
+fn is_ts_identifier(value: &str) -> bool {
+    is_ts_property_identifier(value)
+        && !matches!(
+            value,
+            "any"
+                | "as"
+                | "boolean"
+                | "break"
+                | "case"
+                | "catch"
+                | "class"
+                | "const"
+                | "constructor"
+                | "continue"
+                | "debugger"
+                | "default"
+                | "delete"
+                | "do"
+                | "else"
+                | "enum"
+                | "export"
+                | "extends"
+                | "false"
+                | "finally"
+                | "for"
+                | "function"
+                | "if"
+                | "implements"
+                | "import"
+                | "in"
+                | "instanceof"
+                | "interface"
+                | "let"
+                | "module"
+                | "new"
+                | "null"
+                | "number"
+                | "object"
+                | "package"
+                | "private"
+                | "protected"
+                | "public"
+                | "readonly"
+                | "return"
+                | "static"
+                | "string"
+                | "super"
+                | "switch"
+                | "this"
+                | "throw"
+                | "true"
+                | "try"
+                | "type"
+                | "typeof"
+                | "undefined"
+                | "unknown"
+                | "var"
+                | "void"
+                | "while"
+                | "with"
+                | "yield"
+        )
+}
+
+fn ts_string_literal(value: &str) -> String {
+    serde_json::to_string(value).expect("serializing a TypeScript string literal cannot fail")
+}
+
 // ── shared emission helpers ────────────────────────────────────────────────
 
 fn generated_header(purpose: &str) -> String {
@@ -962,6 +1644,14 @@ fn pascal_case(value: &str) -> String {
         }
     }
     out
+}
+
+fn camel_case(value: &str) -> String {
+    let pascal = pascal_case(value);
+    let mut characters = pascal.chars();
+    characters.next().map_or_else(String::new, |first| {
+        first.to_lowercase().collect::<String>() + characters.as_str()
+    })
 }
 
 // Keep unused-import checker satisfied for symbols referenced only from

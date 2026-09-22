@@ -1,9 +1,9 @@
 # hydra
 
 One API definition, many surfaces. Hydra projects a single, explicit
-`api/operations.yaml` onto three committed surfaces — CLI (clap), HTTP
-(axum), and MCP (tool schemas + stdio runtime) — so the same Rust operation
-implementation powers every interface without drift.
+`api/operations.yaml` onto four committed surfaces — CLI (clap), HTTP
+(axum), MCP (tool schemas + stdio runtime), and a fetch-based TypeScript
+client — so the same operation contract powers every interface without drift.
 
 Extracted from [iris](https://github.com/TechGodHQ/iris)'s `iris-codegen`,
 generalized for reuse across TechGodHQ Rust projects. Born from a spike that
@@ -16,13 +16,13 @@ inference — everything is declared**.
                         |
               cargo run -p hydra-codegen -- write
                         |
-        +---------------+----------------+
-        |               |                |
-   generated/cli.rs  generated/http.rs  generated/mcp.json
-        |               |                |
-   clap structs     axum routes      tool schemas
-        |               |                |
-        +---------------+----------------+
+        +---------------+----------------+----------------------+
+        |               |                |                      |
+   generated/cli.rs  generated/http.rs  generated/mcp.json  generated/ts-client/index.ts
+        |               |                |                      |
+   clap structs     axum routes      tool schemas          fetch SDK
+        |               |                |                      |
+        +---------------+----------------+----------------------+
                         |
             your operation dispatch (one function)
 ```
@@ -36,7 +36,9 @@ inference — everything is declared**.
 - `hydra-mcp-stdio` — a minimal reusable MCP stdio server (JSON-RPC 2.0,
   newline-delimited) you hand your generated tool schemas and one dispatch
   closure.
-- `examples/notes` — a complete three-surface project. Copy it as a template.
+- `examples/notes` — a complete four-surface project. Copy it as a template.
+- `examples/ts-client` — a TypeScript-only Iris consumer fixture with
+  `tsc --noEmit` coverage.
 
 ## Usage
 
@@ -65,12 +67,14 @@ http_dispatch_fn: "crate::execute_operation_http"
 http_state_type: "crate::AppState"
 # Only needed if the definition has raw_request operations:
 # http_raw_dispatch_fn: "crate::execute_operation_raw_http"
+# Exported class name for the generated TypeScript client:
+ts_client_name: "NotesClient"
 ```
 
 3. Generate and commit:
 
 ```bash
-cargo run -p hydra-codegen -- write   # writes generated/{cli.rs,http.rs,mcp.json}
+cargo run -p hydra-codegen -- write   # writes generated/{cli.rs,http.rs,mcp.json,ts-client/index.ts}
 cargo run -p hydra-codegen -- check   # CI guard: fails if artifacts are stale
 ```
 
@@ -118,6 +122,57 @@ dispatch function parses that explicit CLI representation before typed
 validation and persistence. Hydra does not own source-specific event models,
 batch hashing, idempotency, or transactions. `examples/notes` contains a
 tested `ingest_batch` reference operation and is the pattern Iris should use.
+
+### Fetch-based TypeScript client
+
+The fourth surface emits `generated/ts-client/index.ts`, a zero-runtime-
+dependency SDK that uses the platform `fetch` API. It exports one typed
+parameter interface and result alias per unary operation, plus a configured
+client class:
+
+```yaml
+- name: list_threads
+  description: List conversation threads.
+  method: GET
+  path: /threads
+  read: true
+  output_type: Vec<Thread>
+  surfaces: [ts_client]
+  parameters:
+    - name: limit
+      description: Maximum number of threads.
+      type: u32
+      required: false
+      location: query
+```
+
+Parameter `location` is the complete request mapping: path values are
+`encodeURIComponent`-escaped, query values are written only when present, and
+body values are serialized as JSON using their declared wire keys. JSON
+parameters are projected from their explicit JSON Schema (including optional
+object fields, arrays, and unions), never from parameter names. `u32` and
+other numeric definitions map to TypeScript `number`; this is intentionally
+documented as an IEEE-754 precision boundary for `i64`-sized values.
+
+Construct the generated client with `{ baseUrl, token?, fetch? }`. `token`,
+when supplied, becomes a bearer `Authorization` header; `fetch` is injectable
+for tests and non-browser runtimes. Non-2xx responses throw `ApiError` with
+the status and parsed response body. The current output model only carries
+named output type strings, not domain schemas, so named result models are
+generated as opaque `Record<string, unknown>` aliases for the consumer to
+refine. Unary operations with `surfaces: null` include the TypeScript client;
+an explicit allowlist can select `[ts_client]` or exclude it. SSE operations
+must not list `ts_client` until a streaming TypeScript contract is defined.
+
+Run the checked-in Iris consumer fixture with:
+
+```bash
+cd examples/ts-client
+npm install
+npm run generate
+npm run check:generated
+npm run typecheck
+```
 
 ### CLI-only boolean presentation flags
 

@@ -64,4 +64,3 @@ pub struct WatchArgs {
     #[arg(long = "include-cursor", action = clap::ArgAction::SetTrue)]
     pub include_cursor: bool,
 }
-

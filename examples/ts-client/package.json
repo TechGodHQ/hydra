@@ -1,0 +1,15 @@
+{
+  "name": "@techgodhq/iris-client-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate": "cargo run --manifest-path ../../Cargo.toml -p hydra-codegen --bin hydra-codegen -- write",
+    "check:generated": "cargo run --manifest-path ../../Cargo.toml -p hydra-codegen --bin hydra-codegen -- check",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit false --outDir dist --declaration false",
+    "acceptance": "npm run build && node scripts/acceptance.mjs"
+  },
+  "devDependencies": {
+    "typescript": "5.9.2"
+  }
+}

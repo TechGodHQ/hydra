@@ -1,0 +1,203 @@
+# Iris API operation definition — single source of truth for generated surfaces.
+operations:
+  - name: list_messages
+    description: List normalized messages in a thread.
+    method: GET
+    path: /messages/{thread_id}
+    read: true
+    output_type: Vec<Message>
+    parameters:
+      - name: thread_id
+        description: Thread ID to list messages from.
+        type: string
+        required: true
+        location: path
+      - name: limit
+        description: Maximum number of messages to return.
+        type: u32
+        required: false
+        location: query
+      - name: before
+        description: Return messages older than this timestamp cursor.
+        type: string
+        required: false
+        location: query
+  - name: list_threads
+    description: List conversation threads across configured provider instances. Each result includes `provider_instance`, the exact configured instance that owns it.
+    method: GET
+    path: /threads
+    read: true
+    output_type: Vec<Thread>
+    parameters:
+      - name: limit
+        description: Maximum number of threads to return.
+        type: u32
+        required: false
+        location: query
+      - name: cursor
+        description: Cursor; use RFC3339 timestamp or `<RFC3339>|<source>|<thread_uuid>` to avoid skipping timestamp ties.
+        type: string
+        required: false
+        location: query
+  - name: list_contacts
+    description: List contacts across configured provider instances. Each result includes `provider_instance`, the exact configured instance that owns it.
+    method: GET
+    path: /contacts
+    read: true
+    output_type: Vec<Contact>
+    parameters:
+      - name: limit
+        description: Maximum number of contacts to return.
+        type: u32
+        required: false
+        location: query
+      - name: cursor
+        description: Contact ID cursor; returns contacts after this ID in deterministic sort order.
+        type: string
+        required: false
+        location: query
+  - name: send_message
+    description: Send a message to a thread through the owning provider.
+    method: POST
+    path: /messages/{thread_id}
+    read: false
+    output_type: Message
+    parameters:
+      - name: thread_id
+        description: Thread ID to send the message to.
+        type: string
+        required: true
+        location: path
+      - name: body
+        description: Message body to send.
+        type: string
+        required: true
+        location: body
+      - name: provider
+        description: Configured provider instance ID to route the send through when ownership is ambiguous. Discover exact IDs via `GET /providers`; an explicit instance is authoritative.
+        type: string
+        required: false
+        location: body
+      - name: attachments
+        description: >-
+          Attachments to send; each item is inline bytes (`mime_type` +
+          `data_base64`, optional `filename`) or a stored
+          `iris://attachment` reference (`stored_id`).
+        type: json
+        required: false
+        location: body
+        schema:
+          type: array
+          items:
+            oneOf:
+              - type: object
+                properties:
+                  mime_type:
+                    type: string
+                  filename:
+                    type: string
+                  data_base64:
+                    type: string
+                required: [mime_type, data_base64]
+                additionalProperties: false
+              - type: object
+                properties:
+                  stored_id:
+                    type: string
+                required: [stored_id]
+                additionalProperties: false
+        cli:
+          flag: attach
+          multiple: true
+          companions:
+            - flag: attach-mime
+              field: attach_mime
+              description: MIME type for the corresponding local-path --attach value.
+  - name: audit_query
+    description: Query tamper-evident provider audit events.
+    method: GET
+    path: /audit
+    read: true
+    output_type: Vec<AuditEntry>
+    parameters:
+      - name: provider
+        description: Include only events emitted by this provider.
+        type: string
+        required: false
+        location: query
+      - name: action
+        description: Include only this action (`normalize`, `send`, or `fetch_attachment`).
+        type: string
+        required: false
+        location: query
+      - name: since
+        description: Include entries at or after this RFC3339 timestamp.
+        type: string
+        required: false
+        location: query
+      - name: until
+        description: Include entries at or before this RFC3339 timestamp.
+        type: string
+        required: false
+        location: query
+      - name: source_id
+        description: Include only this provider-specific source ID.
+        type: string
+        required: false
+        location: query
+      - name: limit
+        description: Maximum number of entries to return.
+        type: u32
+        required: false
+        location: query
+  - name: ingest_batch
+    description: Transactionally ingest a normalized, replayable source batch.
+    method: POST
+    path: /ingest
+    read: false
+    output_type: json
+    parameters:
+      - name: batch
+        description: Serialized normalized `IngestBatch`. The server computes its canonical hash; `batch_hash` is forbidden.
+        type: json
+        required: true
+        location: body
+        schema:
+          type: object
+          properties:
+            source:
+              type: string
+            replay_key:
+              type: string
+            mutations:
+              type: array
+              items:
+                type: object
+            cursor:
+              type: object
+            audit:
+              type: object
+          required: [source, replay_key, mutations]
+          additionalProperties: false
+        cli:
+          flag: batch
+  - name: subscribe_events
+    description: Subscribe to a fallible realtime event stream over SSE.
+    method: GET
+    path: /v1/events
+    read: true
+    output_type: SSE stream
+    delivery: sse
+    surfaces: [http, cli]
+    cli_command: watch
+    parameters:
+      - name: provider
+        description: Optional exact-match provider filter for emitted events.
+        type: string
+        required: false
+        location: query
+      - name: thread_id
+        description: Optional exact-match thread filter for emitted events.
+        type: string
+        required: false
+        location: query

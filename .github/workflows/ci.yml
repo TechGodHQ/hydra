@@ -20,6 +20,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: examples/ts-client/package-lock.json
+
       - name: Build
         run: cargo build --all-targets
 
@@ -36,6 +42,11 @@ jobs:
         run: |
           cd examples/notes && cargo run -p hydra-codegen --bin hydra-codegen -- check
           cd ../security-scan && cargo run -p hydra-codegen --bin hydra-codegen -- check
+
+      - name: Typecheck TypeScript client example
+        run: |
+          npm ci --prefix examples/ts-client
+          npm run typecheck --prefix examples/ts-client
 
   creed:
     name: Creed context drift
