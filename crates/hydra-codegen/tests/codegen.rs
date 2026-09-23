@@ -12,7 +12,7 @@ use axum::{
     routing::get,
 };
 use clap::Parser;
-use hydra_codegen::{GenerateConfig, generate_all, write_generated};
+use hydra_codegen::{GenerateConfig, generate_all, verify_generated, write_generated};
 use hydra_core::{ApiDefinition, Delivery, HttpMethod, Operation, Parameter, ParameterLocation};
 use pretty_assertions::assert_eq;
 use tower::ServiceExt;
@@ -269,6 +269,7 @@ fn unary_cursor_pagination_projects_deterministically_across_surfaces() {
     assert_eq!(first.cli_rs, second.cli_rs);
     assert_eq!(first.http_rs, second.http_rs);
     assert_eq!(first.mcp_json, second.mcp_json);
+    assert_eq!(first.ts_client_ts, second.ts_client_ts);
 
     assert!(first.cli_rs.contains("GetContextPage(GetContextPageArgs)"));
     assert!(first.cli_rs.contains("pub limit: Option<u32>"));
@@ -702,6 +703,71 @@ fn committed_example_artifacts_are_current() {
     if let Some(e) = err {
         panic!("{e}");
     }
+}
+
+#[test]
+fn committed_ts_client_fixture_is_fresh_and_rejects_stale_copy() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let definition_path = format!("{root}/../../examples/ts-client/api/operations.yaml");
+    let generated_dir = format!("{root}/../../examples/ts-client/generated");
+    let config: GenerateConfig =
+        serde_yaml::from_str(include_str!("../../../examples/ts-client/hydra.yaml"))
+            .expect("TypeScript fixture config parses");
+    config
+        .validate()
+        .expect("TypeScript fixture config validates");
+
+    verify_generated(&definition_path, &generated_dir, &config)
+        .expect("committed Iris TypeScript fixture must be fresh");
+
+    let definition = hydra_core::load_api_definition(&definition_path)
+        .expect("committed Iris TypeScript fixture definition parses");
+    let first = generate_all(&definition, &config);
+    let second = generate_all(&definition, &config);
+    assert_eq!(first.cli_rs, second.cli_rs);
+    assert_eq!(first.http_rs, second.http_rs);
+    assert_eq!(first.mcp_json, second.mcp_json);
+    assert_eq!(first.ts_client_ts, second.ts_client_ts);
+    assert!(
+        !first.ts_client_ts.trim().is_empty(),
+        "Iris fixture must emit a non-empty TypeScript projection"
+    );
+
+    let temp = tempfile::tempdir().expect("temporary generated-artifact directory");
+    let first_dir = temp.path().join("first");
+    let second_dir = temp.path().join("second");
+    write_generated(&first_dir, &first).expect("write first TypeScript fixture copy");
+    write_generated(&second_dir, &second).expect("write second TypeScript fixture copy");
+    for artifact in ["cli.rs", "http.rs", "mcp.json", "ts-client/index.ts"] {
+        assert_eq!(
+            fs::read(first_dir.join(artifact)).expect("read first fixture artifact"),
+            fs::read(second_dir.join(artifact)).expect("read second fixture artifact"),
+            "two generated writes must be byte-identical for {artifact}"
+        );
+    }
+    verify_generated(&definition_path, &first_dir, &config)
+        .expect("fresh temporary Iris fixture copy must verify");
+
+    let ts_path = first_dir.join("ts-client/index.ts");
+    let ts = fs::read_to_string(&ts_path).expect("read copied TypeScript fixture");
+    let stale_ts = ts.replacen(
+        "this.name = \"ApiError\";",
+        "this.name = \"ApiErrorV2\";",
+        1,
+    );
+    assert_ne!(
+        stale_ts, ts,
+        "fixture must contain a type-correct value to mutate"
+    );
+    fs::write(&ts_path, stale_ts).expect("edit only copied TypeScript fixture");
+    assert!(
+        verify_generated(&definition_path, &first_dir, &config).is_err(),
+        "freshness check must reject a stale TypeScript artifact even when its edit is type-correct"
+    );
+
+    write_generated(&first_dir, &first).expect("restore copied TypeScript fixture");
+    verify_generated(&definition_path, &first_dir, &config)
+        .expect("restored temporary Iris fixture copy must verify");
 }
 
 // ── json parameters + CLI representation overrides (COD-411) ───────────────
@@ -1213,6 +1279,11 @@ fn output_flag_fixture_is_fresh_and_deterministic() {
     assert_eq!(first.cli_rs, second.cli_rs);
     assert_eq!(first.http_rs, second.http_rs);
     assert_eq!(first.mcp_json, second.mcp_json);
+    assert_eq!(first.ts_client_ts, second.ts_client_ts);
+    assert!(
+        !first.ts_client_ts.is_empty(),
+        "fixture must emit a TypeScript projection"
+    );
 
     let temp = tempfile::tempdir().expect("temporary generated-artifact directory");
     let first_dir = temp.path().join("first");
@@ -1220,7 +1291,7 @@ fn output_flag_fixture_is_fresh_and_deterministic() {
     write_generated(&first_dir, &first).expect("write first generated artifact set");
     write_generated(&second_dir, &second).expect("write second generated artifact set");
 
-    for artifact in ["cli.rs", "http.rs", "mcp.json"] {
+    for artifact in ["cli.rs", "http.rs", "mcp.json", "ts-client/index.ts"] {
         assert_eq!(
             fs::read(first_dir.join(artifact)).expect("read first generated artifact"),
             fs::read(second_dir.join(artifact)).expect("read second generated artifact"),
@@ -1559,13 +1630,14 @@ fn http_error_response_fixture_is_fresh_and_byte_deterministic() {
     assert_eq!(first.cli_rs, second.cli_rs);
     assert_eq!(first.http_rs, second.http_rs);
     assert_eq!(first.mcp_json, second.mcp_json);
+    assert_eq!(first.ts_client_ts, second.ts_client_ts);
 
     let temp = tempfile::tempdir().expect("temporary generated-artifact directory");
     let first_dir = temp.path().join("first");
     let second_dir = temp.path().join("second");
     write_generated(&first_dir, &first).expect("write first generated artifact set");
     write_generated(&second_dir, &second).expect("write second generated artifact set");
-    for artifact in ["cli.rs", "http.rs", "mcp.json"] {
+    for artifact in ["cli.rs", "http.rs", "mcp.json", "ts-client/index.ts"] {
         assert_eq!(
             fs::read(first_dir.join(artifact)).expect("read first generated artifact"),
             fs::read(second_dir.join(artifact)).expect("read second generated artifact"),

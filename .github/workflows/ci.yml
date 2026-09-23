@@ -46,6 +46,7 @@ jobs:
       - name: Typecheck TypeScript client example
         run: |
           npm ci --prefix examples/ts-client
+          npm run check:generated --prefix examples/ts-client
           npm run typecheck --prefix examples/ts-client
           npm run test:nested-schema --prefix examples/ts-client
 
