@@ -1213,36 +1213,94 @@ fn ts_scalar_type(parameter_type: hydra_core::ParameterType) -> String {
 
 /// Project the supported JSON Schema subset to a deterministic inline type.
 fn ts_schema_type(schema: &Value) -> String {
-    if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array) {
-        return one_of
+    ts_schema_expression(schema).text
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum TsTypePrecedence {
+    Union,
+    Intersection,
+    Primary,
+}
+
+#[derive(Debug)]
+struct TsTypeExpression {
+    text: String,
+    precedence: TsTypePrecedence,
+}
+
+impl TsTypeExpression {
+    const fn primary(text: String) -> Self {
+        Self {
+            text,
+            precedence: TsTypePrecedence::Primary,
+        }
+    }
+
+    fn as_operand(&self, parent: TsTypePrecedence) -> String {
+        if self.precedence < parent {
+            format!("({})", self.text)
+        } else {
+            self.text.clone()
+        }
+    }
+}
+
+fn join_ts_types(
+    expressions: impl IntoIterator<Item = TsTypeExpression>,
+    precedence: TsTypePrecedence,
+    separator: &str,
+) -> TsTypeExpression {
+    let expressions = expressions.into_iter().collect::<Vec<_>>();
+    if expressions.len() == 1 {
+        return expressions
+            .into_iter()
+            .next()
+            .expect("one expression must be present");
+    }
+    TsTypeExpression {
+        text: expressions
             .iter()
-            .map(ts_schema_type)
+            .map(|expression| expression.as_operand(precedence))
             .collect::<Vec<_>>()
-            .join(" | ");
+            .join(separator),
+        precedence,
+    }
+}
+
+fn ts_schema_expression(schema: &Value) -> TsTypeExpression {
+    if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array) {
+        return join_ts_types(
+            one_of.iter().map(ts_schema_expression),
+            TsTypePrecedence::Union,
+            " | ",
+        );
     }
     if let Some(any_of) = schema.get("anyOf").and_then(Value::as_array) {
-        return any_of
-            .iter()
-            .map(ts_schema_type)
-            .collect::<Vec<_>>()
-            .join(" | ");
+        return join_ts_types(
+            any_of.iter().map(ts_schema_expression),
+            TsTypePrecedence::Union,
+            " | ",
+        );
     }
     if let Some(all_of) = schema.get("allOf").and_then(Value::as_array) {
-        return all_of
-            .iter()
-            .map(ts_schema_type)
-            .collect::<Vec<_>>()
-            .join(" & ");
+        return join_ts_types(
+            all_of.iter().map(ts_schema_expression),
+            TsTypePrecedence::Intersection,
+            " & ",
+        );
     }
     if let Some(value) = schema.get("const") {
-        return ts_json_literal(value);
+        return TsTypeExpression::primary(ts_json_literal(value));
     }
     if let Some(values) = schema.get("enum").and_then(Value::as_array) {
-        return values
-            .iter()
-            .map(ts_json_literal)
-            .collect::<Vec<_>>()
-            .join(" | ");
+        return join_ts_types(
+            values
+                .iter()
+                .map(|value| TsTypeExpression::primary(ts_json_literal(value))),
+            TsTypePrecedence::Union,
+            " | ",
+        );
     }
     let nullable = schema
         .get("nullable")
@@ -1252,35 +1310,44 @@ fn ts_schema_type(schema: &Value) -> String {
             .get("type")
             .and_then(Value::as_array)
             .is_some_and(|types| types.iter().any(|kind| kind.as_str() == Some("null")));
-    let mut type_name = match schema.get("type") {
+    let mut type_expression = match schema.get("type") {
         Some(Value::String(kind)) => ts_schema_kind(schema, kind),
-        Some(Value::Array(kinds)) => kinds
-            .iter()
-            .filter_map(Value::as_str)
-            .filter(|kind| *kind != "null")
-            .map(|kind| ts_schema_kind(schema, kind))
-            .collect::<Vec<_>>()
-            .join(" | "),
-        _ => "unknown".to_owned(),
+        Some(Value::Array(kinds)) => join_ts_types(
+            kinds
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|kind| *kind != "null")
+                .map(|kind| ts_schema_kind(schema, kind)),
+            TsTypePrecedence::Union,
+            " | ",
+        ),
+        _ => TsTypeExpression::primary("unknown".to_owned()),
     };
-    if type_name.is_empty() {
-        "unknown".clone_into(&mut type_name);
+    if type_expression.text.is_empty() {
+        type_expression = TsTypeExpression::primary("unknown".to_owned());
     }
     if nullable {
-        type_name.push_str(" | null");
+        type_expression = join_ts_types(
+            [
+                type_expression,
+                TsTypeExpression::primary("null".to_owned()),
+            ],
+            TsTypePrecedence::Union,
+            " | ",
+        );
     }
-    type_name
+    type_expression
 }
 
-fn ts_schema_kind(schema: &Value, kind: &str) -> String {
+fn ts_schema_kind(schema: &Value, kind: &str) -> TsTypeExpression {
     match kind {
-        "string" => "string".to_owned(),
-        "integer" | "number" => "number".to_owned(),
-        "boolean" => "boolean".to_owned(),
-        "null" => "null".to_owned(),
+        "string" => TsTypeExpression::primary("string".to_owned()),
+        "integer" | "number" => TsTypeExpression::primary("number".to_owned()),
+        "boolean" => TsTypeExpression::primary("boolean".to_owned()),
+        "null" => TsTypeExpression::primary("null".to_owned()),
         "array" => schema.get("items").map_or_else(
-            || "Array<unknown>".to_owned(),
-            |items| format!("Array<{}>", ts_schema_type(items)),
+            || TsTypeExpression::primary("Array<unknown>".to_owned()),
+            |items| TsTypeExpression::primary(format!("Array<{}>", ts_schema_type(items))),
         ),
         "object" => {
             let mut fields = Vec::new();
@@ -1311,9 +1378,9 @@ fn ts_schema_kind(schema: &Value, kind: &str) -> String {
             if schema.get("additionalProperties").and_then(Value::as_bool) != Some(false) {
                 fields.push("[key: string]: unknown".to_owned());
             }
-            format!("{{ {} }}", fields.join("; "))
+            TsTypeExpression::primary(format!("{{ {} }}", fields.join("; ")))
         }
-        _ => "unknown".to_owned(),
+        _ => TsTypeExpression::primary("unknown".to_owned()),
     }
 }
 

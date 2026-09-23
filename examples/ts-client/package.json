@@ -7,6 +7,7 @@
     "check:generated": "cargo run --manifest-path ../../Cargo.toml -p hydra-codegen --bin hydra-codegen -- check",
     "typecheck": "tsc --noEmit",
     "build": "tsc --noEmit false --outDir dist --declaration false",
+    "test:nested-schema": "node ../../crates/hydra-codegen/tests/fixtures/nested-ts-schema/check.mjs",
     "acceptance": "npm run build && node scripts/acceptance.mjs"
   },
   "devDependencies": {
