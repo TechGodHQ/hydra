@@ -148,6 +148,14 @@ fn sample_definition() -> ApiDefinition {
     }
 }
 
+fn nested_ts_schema_fixture_definition() -> ApiDefinition {
+    hydra_core::load_api_definition(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/nested-ts-schema/api/operations.yaml"
+    ))
+    .expect("nested TypeScript schema fixture must load")
+}
+
 #[test]
 fn generates_all_four_surfaces_from_definition() {
     let artifacts = generate_all(&sample_definition(), &GenerateConfig::default());
@@ -398,6 +406,24 @@ fn typescript_json_schema_preserves_standard_null_union() {
             .ts_client_ts
             .contains("attachments?: string | null;")
     );
+}
+
+#[test]
+fn typescript_json_schema_preserves_nested_union_intersection_grouping() {
+    let definition = nested_ts_schema_fixture_definition();
+    hydra_core::validate::validate_definition(&definition)
+        .expect("nested TypeScript schema fixture must validate");
+    let artifacts = generate_all(&definition, &GenerateConfig::default());
+    let typescript = artifacts.ts_client_ts;
+
+    assert!(typescript.contains("direct: (\"a\" | \"b\") & \"b\""));
+    assert!(typescript.contains("enum_intersection: (\"red\" | \"blue\") & \"blue\""));
+    assert!(typescript.contains("array: Array<(\"left\" | \"right\") & \"right\">"));
+    assert!(
+        typescript
+            .contains("intersection: (\"nested-left\" | \"nested-right\") & \"nested-right\"")
+    );
+    assert!(typescript.contains("union: \"nested-a\" | \"nested-b\""));
 }
 
 #[test]

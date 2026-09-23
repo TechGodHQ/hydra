@@ -47,6 +47,7 @@ jobs:
         run: |
           npm ci --prefix examples/ts-client
           npm run typecheck --prefix examples/ts-client
+          npm run test:nested-schema --prefix examples/ts-client
 
   creed:
     name: Creed context drift
