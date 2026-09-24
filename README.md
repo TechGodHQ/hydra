@@ -344,6 +344,59 @@ published.** Its annotated tag resolves to
 `afd8303da577898db06212d87e0fd1d4a32a4d3b`; its workspace manifests are aligned
 with `0.2.2`. Hydra is **not** published to crates.io.
 
+### Proposed v0.3.0 preparation (unpublished)
+
+The current preparation candidate changes the workspace manifests to `0.3.0`
+because the public Rust API has source-breaking additions and Hydra now carries
+the fourth, TypeScript client projection. This is **preparation metadata only**:
+there is no `v0.3.0` tag or GitHub release, no crates.io/npm publication, no
+consumer repin, and no deployment. The exact preparation merge SHA must be
+recorded after this change lands; it must not be guessed from a moving branch.
+
+The candidate's exact merged inputs are:
+
+- #10 / COD-486 — `9e0b6039c8ea0a1dd1cb7528ef5676c9be40a03a`, explicit CLI-only
+  boolean presentation flags.
+- #11 / COD-490 — `503c7f75cf9ff28e8ae2119f5b1d4f5582be15f4`, release-status
+  documentation.
+- #12 / COD-487 — `40984272cf3a9f77094383dae5f94f4432c3a273`, declared typed HTTP
+  errors.
+- #13 / COD-507 — `abb1c640bba4b8fbd654821c03f028d6d8a243f7`, rendered-help
+  evidence.
+- #14 / COD-508 — `b36ac5f3e998d9f87c81348702c0946db93f309b`, malformed HTTP-error
+  constant validation.
+- #15 / COD-510 — `a7ce4bd620907ae06b599a5cbea50685cd78959b`, the OpenSpec-only
+  stateless MCP Streamable HTTP contract. It does **not** provide or advertise
+  an MCP-over-HTTP runtime.
+- #16 / COD-515 — `b210ff55147dbf5667b2c098c833a94a96126fba`, the TypeScript
+  client projection.
+- #17 / COD-521 — `a15cf8f90e94322d897b888bf34f0a3c25f338b9`, nested TypeScript
+  JSON Schema grouping correction.
+- #18 / COD-522 — `9ba68851c71d5e761a09389ea160419a6a5f68cb`, TypeScript fixture
+  freshness and byte-identical regeneration coverage.
+
+Migration notes for a future authorized consumer repin:
+
+- Rust callers constructing `Operation` with struct literals must add
+  `cli_output_flags: vec![]` and `http_error_responses: vec![]`; exhaustive
+  matches on `Surface` must handle `Surface::TsClient`.
+- Rust callers constructing `GenerateConfig` with a struct literal must add
+  `ts_client_name` (or use `GenerateConfig::default()`), and callers
+  constructing or destructuring `GeneratedArtifacts` must handle its
+  `ts_client_ts` fourth artifact.
+- Regenerate and commit all four generated artifacts after pinning the exact
+  published tag. The TypeScript projection maps `i64`-sized values to
+  JavaScript `number` with an IEEE-754 precision boundary, and named results
+  remain opaque `Record<string, unknown>` aliases in this release line.
+- The tag and git dependency examples below are valid only after an explicit
+  release authorization and a verified public `v0.3.0` tag; this preparation
+  does not authorize or imply that publication:
+
+  ```toml
+  hydra-core = { git = "https://github.com/TechGodHQ/hydra", tag = "v0.3.0" }
+  hydra-codegen = { git = "https://github.com/TechGodHQ/hydra", tag = "v0.3.0" }
+  ```
+
 - **Historical tags are immutable.** Tags `v0.1.0` … `v0.2.1` were cut from
   commits whose workspace manifests still said `0.1.0`; they are reproducible
   git pins and will never be moved or rewritten. From v0.2.2 onward the
