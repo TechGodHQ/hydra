@@ -339,21 +339,17 @@ existed.
 
 ## Releases & versioning
 
-**Status: [v0.2.2](https://github.com/TechGodHQ/hydra/releases/tag/v0.2.2) is
-published.** Its annotated tag resolves to
-`afd8303da577898db06212d87e0fd1d4a32a4d3b`; its workspace manifests are aligned
-with `0.2.2`. Hydra is **not** published to crates.io.
+**Status: [v0.3.0](https://github.com/TechGodHQ/hydra/releases/tag/v0.3.0) is
+published.** Its signed annotated tag object is `a663045a704ca500d3f2b0ea471906dd42ae8674`
+and peels to the exact release target
+`4b518b76ea9f731d75ae3e53f536f669dd493791`; all five workspace manifests are
+aligned with `0.3.0`. The public release is non-draft and non-prerelease.
+Hydra is **not** published to crates.io or npm.
 
-### Proposed v0.3.0 preparation (unpublished)
+### v0.3.0 release contents
 
-The current preparation candidate changes the workspace manifests to `0.3.0`
-because the public Rust API has source-breaking additions and Hydra now carries
-the fourth, TypeScript client projection. This is **preparation metadata only**:
-there is no `v0.3.0` tag or GitHub release, no crates.io/npm publication, no
-consumer repin, and no deployment. The exact preparation merge SHA must be
-recorded after this change lands; it must not be guessed from a moving branch.
-
-The candidate's exact merged inputs are:
+The `v0.3.0` release carries the source-breaking Rust API additions and the
+fourth, TypeScript client projection. Its exact merged inputs are:
 
 - #10 / COD-486 — `9e0b6039c8ea0a1dd1cb7528ef5676c9be40a03a`, explicit CLI-only
   boolean presentation flags.
@@ -375,7 +371,12 @@ The candidate's exact merged inputs are:
 - #18 / COD-522 — `9ba68851c71d5e761a09389ea160419a6a5f68cb`, TypeScript fixture
   freshness and byte-identical regeneration coverage.
 
-Migration notes for a future authorized consumer repin:
+PR #19 / COD-523 supplied the `0.3.0` preparation metadata and compatibility
+notes at the published target. Publication is complete, but this release does
+not itself authorize a consumer to repin, regenerate, deploy, or publish a
+downstream package; those actions remain separately owned and authorized.
+
+Migration notes for an authorized consumer repin:
 
 - Rust callers constructing `Operation` with struct literals must add
   `cli_output_flags: vec![]` and `http_error_responses: vec![]`; exhaustive
@@ -388,9 +389,8 @@ Migration notes for a future authorized consumer repin:
   published tag. The TypeScript projection maps `i64`-sized values to
   JavaScript `number` with an IEEE-754 precision boundary, and named results
   remain opaque `Record<string, unknown>` aliases in this release line.
-- The tag and git dependency examples below are valid only after an explicit
-  release authorization and a verified public `v0.3.0` tag; this preparation
-  does not authorize or imply that publication:
+- The immutable published tag can be used in a consumer git dependency after
+  that consumer's own authorization and regeneration gates are satisfied:
 
   ```toml
   hydra-core = { git = "https://github.com/TechGodHQ/hydra", tag = "v0.3.0" }
@@ -400,12 +400,14 @@ Migration notes for a future authorized consumer repin:
 - **Historical tags are immutable.** Tags `v0.1.0` … `v0.2.1` were cut from
   commits whose workspace manifests still said `0.1.0`; they are reproducible
   git pins and will never be moved or rewritten. From v0.2.2 onward the
-  manifest version will agree with the tag at the moment of tagging.
-- **What v0.2.2 covers:** merged PRs [#6](https://github.com/TechGodHQ/hydra/pull/6)
+  manifest version agrees with the tag at the moment of tagging.
+- **What v0.2.2 covered:** merged PRs [#6](https://github.com/TechGodHQ/hydra/pull/6)
   (DeepSec tracer example), [#7](https://github.com/TechGodHQ/hydra/pull/7)
   (layered agent context), and [#8](https://github.com/TechGodHQ/hydra/pull/8)
   (unary cursor pagination fixture) — release metadata, reference coverage,
   and documentation/context changes. No production changes under `crates/*/src`.
+  Its annotated tag resolves to
+  `afd8303da577898db06212d87e0fd1d4a32a4d3b`.
 - **Consumers pin git tags, not crates.io.** Consumers may pin the published
   `v0.2.2` tag and regenerate:
   `hydra-core = { git = "https://github.com/TechGodHQ/hydra", tag = "v0.2.2" }`
