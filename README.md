@@ -36,6 +36,10 @@ inference — everything is declared**.
 - `hydra-mcp-stdio` — a minimal reusable MCP stdio server (JSON-RPC 2.0,
   newline-delimited) you hand your generated tool schemas and one dispatch
   closure.
+- `hydra-mcp-http` — a reusable, stateless MCP Streamable HTTP server for the
+  `2026-07-28` profile. It validates explicit per-request metadata, mirrored
+  method/name headers, and an explicit Origin policy, then calls one
+  consumer-owned async dispatch closure.
 - `examples/notes` — a complete four-surface project. Copy it as a template.
 - `examples/ts-client` — a TypeScript-only Iris consumer fixture with
   `tsc --noEmit` coverage.
@@ -80,6 +84,55 @@ cargo run -p hydra-codegen -- check   # CI guard: fails if artifacts are stale
 
 4. `include!` the generated files, implement one dispatch function, and wire
    your binaries. See `examples/notes/src/lib.rs`.
+
+### Stateless MCP Streamable HTTP
+
+`hydra-mcp-http` is an embedded-host runtime, not a standalone service. The
+host owns the listener and nests the returned router at an explicit path. The
+reference Notes consumer mounts it at `/mcp`:
+
+```bash
+cargo run -p notes-example --bin notes-mcp-http
+```
+
+The Notes binary binds only to `127.0.0.1:8942` and prints the local endpoint.
+A current-protocol client sends one JSON-RPC request per POST with:
+
+- `Content-Type: application/json`;
+- an `Accept` value explicitly containing both `application/json` and
+  `text/event-stream`;
+- `MCP-Protocol-Version: 2026-07-28`;
+- `Mcp-Method` matching the JSON-RPC method; and
+- `params._meta` containing
+  `io.modelcontextprotocol/protocolVersion` and
+  `io.modelcontextprotocol/clientCapabilities`.
+
+`tools/call` additionally mirrors `params.name` through `Mcp-Name`. Names that
+cannot be represented as a safe plain header use the MCP Base64 sentinel form
+`=?base64?{value}?=`. The runtime validates the generated tool manifest at
+construction, preserves its exact order and objects for `tools/list`, and
+rejects unsupported `x-mcp-header` annotations rather than advertising a
+contract it cannot validate.
+
+The default `OriginPolicy::RejectPresented` permits non-browser clients that
+omit `Origin` and rejects every presented Origin. Hosts that deliberately need
+browser-origin validation must provide a finite `OriginPolicy::AllowExact`
+list and own any separately reviewed CORS or Private Network Access layer.
+This runtime emits no CORS/PNA headers, handles no `OPTIONS` preflights, does
+not create sessions or `Mcp-Session-Id` headers, has no GET stream, and does
+not downgrade to the legacy `initialize` protocol. It also never binds a
+listener, chooses a mount path, or implements consumer operation semantics.
+
+The reproducible reference checks are:
+
+```bash
+cargo test --locked -p hydra-mcp-http
+cargo test --locked -p notes-example --test mcp_http
+```
+
+The second test starts a real ephemeral loopback listener and uses an
+independent HTTP client fixture for `server/discover` → `tools/list` →
+`tools/call`; it is not a `Router::oneshot`-only test.
 
 ### JSON batch operations
 
