@@ -48,7 +48,8 @@ This follow-up maps the previously missing negative paths to tests; it does not
 change the frozen proposal, design, spec, runtime, generated artifacts, or policy.
 
 - [x] `crates/hydra-mcp-http/tests/transport.rs::named_rejection_matrix_is_static_value_free_and_never_dispatches` — actual router requests for media, malformed JSON/envelopes/batches/notifications, metadata, version/method/name headers (missing, non-text, mismatch), Base64/control names, undeclared tools and invalid arguments; assert status/code/message/ID, redaction, no CORS/session headers and zero dispatches.
-- [x] `crates/hydra-mcp-http/tests/transport.rs::exact_origin_allowlist_rejection_is_pre_dispatch_and_emits_no_browser_headers` — a valid exact-allowed Origin first dispatches once on the same router/counter (then resets); the rejected Origin proves zero dispatch/reflection/CORS/session headers.
+- [x] `crates/hydra-mcp-http/tests/transport.rs::call_metadata_and_mirrored_headers_reject_before_dispatch` — six missing/non-text/mismatched protocol/method-header cases and six missing/invalid metadata cases start from a declared, otherwise-valid `tools/call`; assert exact HTTP/RPC/message/ID, redaction, absent CORS/session headers and zero dispatch after a same-router valid call dispatches once. Retain the separate list/envelope rows rather than treating their zero-dispatch result as call-specific evidence.
+- [x] `crates/hydra-mcp-http/tests/transport.rs::exact_origin_allowlist_rejection_is_pre_dispatch_and_emits_no_browser_headers` — a valid exact-allowed Origin first dispatches once on the same router/counter (then resets), and its successful response has no CORS/PNA/session grant headers. Realistic OPTIONS with that same allowed Origin/policy returns 405 with no grants or dispatch; the rejected Origin also proves zero dispatch/reflection/CORS/session headers.
 - [x] `crates/hydra-mcp-http/tests/transport.rs::construction_rejection_matrix_names_tools_without_reflecting_manifest_values` and `construction_rejects_invalid_exact_origin_entries` — wrapper/array/tool/name/schema shapes, duplicates, nested and array-schema annotations, a `oneOf` annotation exercising JSON-array recursion, and unsafe/duplicate explicit origin entries.
 - [x] `crates/hydra-mcp-http/tests/transport.rs::realistic_options_preflight_and_delete_remain_unsupported_without_headers` — realistic CORS/PNA OPTIONS and DELETE return 405 without session/CORS/PNA headers.
 - [x] `examples/notes/tests/mcp_http.rs::independent_loopback_client_discovers_lists_and_calls_notes` — bounded independent real-TCP client (five-second per-request timeout and 1 MiB response cap), exact discovery tools capability, full positive response envelopes, plus rejected Origin, missing/mismatched `Mcp-Name`, matching mirrored undeclared tool, and exact synthetic note-stats before/after equality.
@@ -64,10 +65,10 @@ Notes acceptance refers to `examples/notes/tests/mcp_http.rs`.
 | embedded host mounts explicit endpoint | Notes `independent_loopback_client_discovers_lists_and_calls_notes` starts the host-owned listener and calls the nested `/mcp` endpoint, then shuts down the host |
 | generated tool schemas stay transport-identical | `discover_list_and_call_use_the_real_router_boundary` plus Notes acceptance compares all tools and ordering to `GENERATED_MCP_JSON` |
 | valid modern discovery without a session | `discover_list_and_call_use_the_real_router_boundary` plus Notes acceptance, including `capabilities.tools == {}` |
-| mismatched mirrored header | `named_rejection_matrix_is_static_value_free_and_never_dispatches` covers missing, malformed and mismatched protocol/method/name headers, including malformed/unterminated/control/non-UTF8 Base64 name representations |
+| mismatched mirrored header | `call_metadata_and_mirrored_headers_reject_before_dispatch` proves protocol/method rejection on dispatchable calls; `named_rejection_matrix_is_static_value_free_and_never_dispatches` retains list/name coverage including malformed/unterminated/control/non-UTF8 Base64 name representations |
 | unsupported version | `unsupported_version_and_legacy_methods_are_truthful` plus named matrix, including exact supported-version error data |
 | browser Origin not silently trusted | named matrix (default reject-presented, before decoding) and `exact_origin_allowlist_rejection_is_pre_dispatch_and_emits_no_browser_headers` |
-| Origin validation does not grant browser access | `origin_is_checked_before_decoding_and_exact_allowlists_are_inbound_only` and `realistic_options_preflight_and_delete_remain_unsupported_without_headers` |
+| Origin validation does not grant browser access | `exact_origin_allowlist_rejection_is_pre_dispatch_and_emits_no_browser_headers` checks successful allowed-Origin and same-policy OPTIONS response headers; `realistic_options_preflight_and_delete_remain_unsupported_without_headers` retains default-policy OPTIONS/DELETE coverage |
 | legacy transport methods unsupported | `unsupported_version_and_legacy_methods_are_truthful` (GET, OPTIONS, and initialize with exact `-32601` method-not-found message naming `PROTOCOL_VERSION`) and realistic OPTIONS/DELETE test |
 | valid generated tool reaches consumer | `discover_list_and_call_use_the_real_router_boundary`, `omitted_tool_arguments_dispatch_as_an_empty_object`, `sentinel_encoded_tool_names_are_compared_after_decoding`, and Notes acceptance |
 | undeclared tool cannot dispatch | named matrix and Notes rejected-call sequence with fixture-state before/after equality |
@@ -79,8 +80,10 @@ missing/invalid ID or method, missing/non-object params/metadata; missing/wrong
 protocol or capabilities; missing/non-string/empty/control/unknown tool names;
 non-object arguments. Each row checks exact HTTP/RPC code, safe static message,
 invalid-ID null handling where applicable, no CORS/PNA/session headers, and no
-consumer dispatch. The same instrumented router first dispatches a valid control
-call exactly once, avoiding a vacuous no-dispatch assertion. Construction tests
+consumer dispatch. The instrumented router first dispatches a valid control call
+exactly once. The dedicated call-metadata/header matrix supplies otherwise-valid
+dispatchable call baselines; list-only negatives do not establish that property.
+Construction tests
 cover wrapper, array, tool, name and schema shapes, duplicates and explicit Origin
 configuration. `dispatch_errors_are_tool_results_and_invalid_ids_are_null` retains
 safe execution-error (`isError`) and structured/text result behavior.

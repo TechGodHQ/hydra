@@ -968,6 +968,123 @@ async fn named_rejection_matrix_is_static_value_free_and_never_dispatches() {
     assert_eq!(dispatches.load(Ordering::SeqCst), 0);
 }
 
+async fn assert_static_call_rejection(
+    response: Response,
+    code: i64,
+    message: &str,
+    case: (&str, &str),
+) {
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case:?}");
+    for header in response.headers().keys() {
+        let header = header.as_str().to_ascii_lowercase();
+        assert_ne!(header, "mcp-session-id", "{case:?}");
+        assert!(!header.starts_with("access-control-"), "{case:?}");
+    }
+    let body = json_body(response).await;
+    assert_eq!(body["jsonrpc"], "2.0", "{case:?}");
+    assert_eq!(body["id"], 1, "{case:?}");
+    assert_eq!(body["error"]["code"], code, "{case:?}");
+    assert_eq!(body["error"]["message"], message, "{case:?}");
+    assert!(!body.to_string().contains("SECRET_SENTINEL"), "{case:?}");
+}
+
+#[tokio::test]
+async fn call_metadata_and_mirrored_headers_reject_before_dispatch() {
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let dispatches_for_closure = dispatches.clone();
+    let app = router(config(manifest("echo")), move |_, _| {
+        let dispatches = dispatches_for_closure.clone();
+        async move {
+            dispatches.fetch_add(1, Ordering::SeqCst);
+            Ok(json!(null))
+        }
+    })
+    .unwrap();
+    let mut cases = Vec::new();
+    for header in ["MCP-Protocol-Version", "Mcp-Method"] {
+        for (name, value) in [
+            ("missing mirrored call header", None),
+            (
+                "non-text mirrored call header",
+                Some(HeaderValue::from_bytes(&[0x80]).unwrap()),
+            ),
+            (
+                "mismatched mirrored call header",
+                Some(HeaderValue::from_static("HEADER_SECRET_SENTINEL")),
+            ),
+        ] {
+            let mut request = call_request("echo", Some(json!({})));
+            if let Some(value) = value {
+                request.headers_mut().insert(header, value);
+            } else {
+                request.headers_mut().remove(header);
+            }
+            cases.push((name, header, request, -32020, "HeaderMismatch"));
+        }
+    }
+    for (name, metadata, message) in [
+        (
+            "missing call metadata",
+            None,
+            "Request metadata is required",
+        ),
+        (
+            "non-object call metadata",
+            Some(json!([])),
+            "Request metadata is required",
+        ),
+        (
+            "missing call protocol version",
+            Some(json!({"io.modelcontextprotocol/clientCapabilities":{}})),
+            "Request protocol metadata is required",
+        ),
+        (
+            "non-string call protocol version",
+            Some(
+                json!({"io.modelcontextprotocol/protocolVersion":17,"io.modelcontextprotocol/clientCapabilities":{}}),
+            ),
+            "Request protocol metadata is required",
+        ),
+        (
+            "missing call capabilities",
+            Some(json!({"io.modelcontextprotocol/protocolVersion":PROTOCOL_VERSION})),
+            "Request client capabilities are required",
+        ),
+        (
+            "non-object call capabilities",
+            Some(
+                json!({"io.modelcontextprotocol/protocolVersion":PROTOCOL_VERSION,"io.modelcontextprotocol/clientCapabilities":[]}),
+            ),
+            "Request client capabilities are required",
+        ),
+    ] {
+        let mut request = call_request("echo", Some(json!({})));
+        let mut call_params = json!({"name":"echo","arguments":{}});
+        if let Some(metadata) = metadata {
+            call_params["_meta"] = metadata;
+        }
+        replace_body!(
+            &mut request,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":call_params}),
+        );
+        cases.push((name, "_meta", request, -32600, message));
+    }
+
+    // Every negative retains an otherwise dispatchable declared call, not tools/list.
+    let control = app
+        .clone()
+        .oneshot(call_request("echo", Some(json!({}))))
+        .await
+        .unwrap();
+    assert_eq!(control.status(), StatusCode::OK);
+    assert_eq!(dispatches.swap(0, Ordering::SeqCst), 1);
+    for (name, field, request, code, message) in cases {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0, "{name}: {field}");
+        assert_static_call_rejection(response, code, message, (name, field)).await;
+    }
+}
+
 #[tokio::test]
 async fn omitted_tool_arguments_dispatch_as_an_empty_object() {
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -1025,11 +1142,40 @@ async fn exact_origin_allowlist_rejection_is_pre_dispatch_and_emits_no_browser_h
     );
     let allowed_response = app.clone().oneshot(allowed_request).await.unwrap();
     assert_eq!(allowed_response.status(), StatusCode::OK);
+    for header in allowed_response.headers().keys() {
+        let name = header.as_str().to_ascii_lowercase();
+        assert_ne!(name, "mcp-session-id");
+        assert!(!name.starts_with("access-control-"));
+    }
     assert_eq!(
         dispatches.swap(0, Ordering::SeqCst),
         1,
         "valid allowed-origin control should dispatch exactly once"
     );
+
+    let options = app
+        .clone()
+        .oneshot(
+            Request::options("/")
+                .header("Origin", "https://trusted.example")
+                .header("Access-Control-Request-Method", "POST")
+                .header(
+                    "Access-Control-Request-Headers",
+                    "content-type,mcp-protocol-version,mcp-method,mcp-name",
+                )
+                .header("Access-Control-Request-Private-Network", "true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(options.status(), StatusCode::METHOD_NOT_ALLOWED);
+    for header in options.headers().keys() {
+        let name = header.as_str().to_ascii_lowercase();
+        assert_ne!(name, "mcp-session-id");
+        assert!(!name.starts_with("access-control-"));
+    }
+    assert_eq!(dispatches.load(Ordering::SeqCst), 0);
 
     let mut request = call_request("echo", Some(json!({})));
     request.headers_mut().insert(
