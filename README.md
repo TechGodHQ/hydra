@@ -127,12 +127,28 @@ The reproducible reference checks are:
 
 ```bash
 cargo test --locked -p hydra-mcp-http
-cargo test --locked -p notes-example --test mcp_http
+cargo test --locked -p notes-example --test mcp_http -- --nocapture
 ```
 
-The second test starts a real ephemeral loopback listener and uses an
-independent HTTP client fixture for `server/discover` → `tools/list` →
-`tools/call`; it is not a `Router::oneshot`-only test.
+The second command starts an isolated ephemeral loopback listener and drives it
+with an independent HTTP client fixture. It prints the actual synthetic
+`server/discover` → `tools/list` → `tools/call` responses, then the rejected
+Origin/name/undeclared-tool responses and a fixture-state before/after check;
+this is real TCP traffic, not a `Router::oneshot`-only transcript. It requires
+no manually running service or credentials.
+
+For the standalone reference host, start it with
+`cargo run --locked -p notes-example --bin notes-mcp-http`. It binds only to
+`127.0.0.1:8942`; stop that sample process with Ctrl-C. The example host owns
+the listener lifecycle; the generic router has no listener or MCP session to
+shut down. Embedding applications must wire their own process signal and
+listener shutdown policy. The transport does not implement protocol-level
+DELETE session termination.
+
+A consumer dispatch error is returned as client-visible tool text. Consumer
+implementations are responsible for returning only safe, value-free public
+messages; do not forward secrets, raw request/configuration data, or internal
+error details.
 
 ### JSON batch operations
 
