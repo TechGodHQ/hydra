@@ -36,7 +36,7 @@ async fn fetch_bytes(
     Query(query): Query<BTreeMap<String, String>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let response_body = crate::raw_response_dispatch(
+    let response_body: Vec<u8> = crate::raw_response_dispatch(
         &state,
         "fetch_bytes",
         GeneratedOperationInput {

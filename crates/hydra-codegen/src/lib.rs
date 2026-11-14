@@ -700,7 +700,7 @@ fn push_raw_response_handler(
         out.push_str("    Json(body): Json<Value>,\n");
     }
     out.push_str(") -> Response {\n");
-    out.push_str("    let response_body = ");
+    out.push_str("    let response_body: Vec<u8> = ");
     out.push_str(&config.http_raw_response_dispatch_fn);
     out.push_str("(\n        &state,\n        ");
     out.push_str(&rust_string_literal(&operation.name));

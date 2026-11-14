@@ -421,7 +421,10 @@ response representation:
 The generated handler passes the operation name and existing
 `GeneratedOperationInput` to the consumer's configured
 `http_raw_response_dispatch_fn`, which asynchronously returns `Vec<u8>`.
-Hydra emits those bytes unchanged as one finite response with fixed HTTP 200
+The generated handler type-annotates its dispatch binding as `Vec<u8>`, so a
+dispatcher returning any other type (for example `axum::body::Body`) fails to
+compile. Hydra emits those bytes unchanged as one finite response with fixed
+HTTP 200
 and the declared `Content-Type`; it does not UTF-8 decode, JSON-serialize,
 base64-wrap, stream, or select dynamic status/headers. The consumer adapter
 delegates to the same common operation implementation used by other surfaces.

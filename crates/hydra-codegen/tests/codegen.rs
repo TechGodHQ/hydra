@@ -2210,3 +2210,133 @@ operations:
         "v1 error fields support only declared string values"
     );
 }
+
+fn lockfile_package_version(lock_text: &str, package: &str) -> String {
+    let needle = format!("name = \"{package}\"");
+    let mut lines = lock_text.lines().map(str::trim);
+    while let Some(line) = lines.next() {
+        if line != needle {
+            continue;
+        }
+        for candidate in lines.by_ref() {
+            if candidate == "[[package]]" {
+                break;
+            }
+            if let Some(version) = candidate.strip_prefix("version = ") {
+                return version.replace('"', "");
+            }
+        }
+    }
+    panic!("workspace lockfile has no {package} entry");
+}
+
+/// Materialize a scratch consumer crate that includes the committed generated
+/// raw-response module and binds a dispatcher with the requested return type.
+fn raw_response_consumer_scratch(
+    name: &str,
+    dispatch_return_type: &str,
+    dispatch_body: &str,
+) -> PathBuf {
+    let scratch_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("raw-response-compile-tests");
+    fs::create_dir_all(&scratch_root).expect("create raw-response compile-test root");
+    let crate_dir = scratch_root.join(name);
+    let src_dir = crate_dir.join("src");
+    fs::create_dir_all(&src_dir).expect("create scratch consumer src dir");
+    fs::write(
+        src_dir.join("http.rs"),
+        include_str!("fixtures/raw-http-response/generated/http.rs"),
+    )
+    .expect("copy committed generated fixture into scratch consumer");
+
+    let lock_text = include_str!("../../../Cargo.lock");
+    let manifest = format!(
+        "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n\
+         [dependencies]\naxum = \"{}\"\nserde_json = \"{}\"\n\n[workspace]\n",
+        lockfile_package_version(lock_text, "axum"),
+        lockfile_package_version(lock_text, "serde_json"),
+    );
+    fs::write(crate_dir.join("Cargo.toml"), manifest).expect("write scratch consumer manifest");
+
+    let lib_rs = format!(
+        "#[derive(Clone, Default)]\npub struct RawResponseFixtureState;\n\n\
+         pub mod generated_http {{\n    include!(\"http.rs\");\n}}\n\n\
+         #[allow(clippy::unused_async)]\n\
+         pub async fn raw_response_dispatch(\n    \
+         _state: &RawResponseFixtureState,\n    \
+         _operation: &str,\n    \
+         _input: generated_http::GeneratedOperationInput,\n) -> {dispatch_return_type} {{\n    \
+         {dispatch_body}\n}}\n\n\
+         pub fn build_router() -> axum::Router {{\n    \
+         generated_http::generated_router().with_state(RawResponseFixtureState)\n}}\n"
+    );
+    fs::write(src_dir.join("lib.rs"), lib_rs).expect("write scratch consumer lib.rs");
+    crate_dir
+}
+
+fn check_raw_response_consumer(
+    name: &str,
+    dispatch_return_type: &str,
+    dispatch_body: &str,
+) -> (bool, String) {
+    let crate_dir = raw_response_consumer_scratch(name, dispatch_return_type, dispatch_body);
+    let shared_target = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("raw-response-compile-tests")
+        .join("target");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let output = std::process::Command::new(cargo)
+        .args(["check", "--offline"])
+        .arg("--manifest-path")
+        .arg(crate_dir.join("Cargo.toml"))
+        .env("CARGO_TARGET_DIR", shared_target)
+        .output()
+        .expect("spawn nested cargo check for raw-response consumer");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    (output.status.success(), log)
+}
+
+#[test]
+fn raw_response_generated_binding_is_annotated_as_finite_bytes() {
+    let artifacts = generate_all(
+        &raw_response_fixture_definition(),
+        &raw_response_fixture_config(),
+    );
+    assert!(
+        artifacts.http_rs.contains("let response_body: Vec<u8> = "),
+        "generated raw-response handler must type-annotate its dispatch binding as Vec<u8>"
+    );
+}
+
+#[test]
+fn compiled_raw_response_consumer_rejects_body_dispatch_and_accepts_finite_bytes() {
+    let (control_ok, control_log) =
+        check_raw_response_consumer("raw-response-control", "Vec<u8>", "Vec::new()");
+    assert!(
+        control_ok,
+        "finite Vec<u8> raw-response consumer must compile:\n{control_log}"
+    );
+
+    let (violation_ok, violation_log) = check_raw_response_consumer(
+        "raw-response-body-dispatch-rejected",
+        "axum::body::Body",
+        "unreachable!(\"streaming dispatchers must be rejected at compile time\")",
+    );
+    assert!(
+        !violation_ok,
+        "a Body-returning raw-response dispatcher must fail to compile:\n{violation_log}"
+    );
+    assert!(
+        violation_log.contains("E0308"),
+        "rejection must be a type mismatch at the generated binding:\n{violation_log}"
+    );
+}
