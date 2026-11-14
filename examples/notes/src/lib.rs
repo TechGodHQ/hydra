@@ -6,9 +6,20 @@
 //! same `execute_operation` dispatch. Regenerate with
 //! `cargo run -p hydra-codegen -- write` from the workspace root.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    convert::Infallible,
+    sync::{Arc, Mutex},
+};
 
-use axum::{Router, http::StatusCode, response::IntoResponse};
+use axum::{
+    Router,
+    http::StatusCode,
+    response::{
+        IntoResponse,
+        sse::{Event, Sse},
+    },
+    routing::get,
+};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -392,9 +403,29 @@ pub async fn execute_operation_raw_http(
 
 // ── Surface wiring ────────────────────────────────────────────────────────
 
+/// Bind the consumer-owned handler for Hydra's generated `subscribe_events`
+/// SSE hook. The finite fixture stream is synthetic and does not use the
+/// shared unary operation dispatcher.
+pub fn bind_runtime_sse_subscribe_events(router: Router<AppState>) -> Router<AppState> {
+    router.route("/events/stream", get(runtime_sse_subscribe_events))
+}
+
+async fn runtime_sse_subscribe_events()
+-> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    let events = [
+        Ok(Event::default()
+            .event("note.created")
+            .data(r#"{"id":"n1"}"#)),
+        Ok(Event::default()
+            .event("note.updated")
+            .data(r#"{"id":"n1","title":"fixture"}"#)),
+    ];
+    Sse::new(futures_util::stream::iter(events))
+}
+
 /// Build the full HTTP router for the notes service.
 pub fn http_router(state: AppState) -> Router {
-    generated::generated_router().with_state(state)
+    generated::bind_subscribe_events(generated::generated_router()).with_state(state)
 }
 
 /// HTTP entry: `notes-http` serves on 127.0.0.1:8941.
