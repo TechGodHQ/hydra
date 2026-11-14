@@ -1436,13 +1436,12 @@ fn ts_schema_kind(schema: &Value, kind: &str) -> TsTypeExpression {
                 let required = schema
                     .get("required")
                     .and_then(Value::as_array)
-                    .map(|values| {
+                    .map_or_else(std::collections::BTreeSet::new, |values| {
                         values
                             .iter()
                             .filter_map(Value::as_str)
                             .collect::<std::collections::BTreeSet<_>>()
-                    })
-                    .unwrap_or_default();
+                    });
                 for (name, property) in properties {
                     fields.push(format!(
                         "{}{}: {}",
