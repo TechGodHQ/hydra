@@ -53,6 +53,7 @@ pub fn validate_definition(definition: &ApiDefinition) -> Result<()> {
         validate_operation_parameters(operation)?;
         validate_operation_surfaces(operation)?;
         validate_operation_raw_request(operation)?;
+        validate_operation_raw_response(operation)?;
         validate_operation_cli_overrides(operation)?;
         validate_operation_http_error_responses(operation)?;
         validate_operation_ts_client(operation)?;
@@ -506,6 +507,84 @@ fn validate_operation_raw_request(operation: &Operation) -> Result<()> {
         operation.name
     );
     Ok(())
+}
+
+/// Validate the finite raw-response contract without changing the existing
+/// raw-request input boundary.
+fn validate_operation_raw_response(operation: &Operation) -> Result<()> {
+    if !operation.is_raw_response() {
+        anyhow::ensure!(
+            operation.raw_response_content_type.is_none(),
+            "operation {} declares raw_response_content_type without raw_response: true",
+            operation.name
+        );
+        return Ok(());
+    }
+
+    anyhow::ensure!(
+        operation
+            .surfaces
+            .as_ref()
+            .is_some_and(|surfaces| surfaces.len() == 1 && surfaces.contains(&Surface::Http)),
+        "operation {} uses raw_response but does not list exactly the http surface; \
+         raw responses are http-only",
+        operation.name
+    );
+    anyhow::ensure!(
+        !operation.is_sse(),
+        "operation {} uses raw_response with delivery: sse; raw responses are unary-only",
+        operation.name
+    );
+    anyhow::ensure!(
+        !operation.is_raw_request(),
+        "operation {} uses both raw_request and raw_response; this combination is unsupported",
+        operation.name
+    );
+    anyhow::ensure!(
+        operation.http_error_responses.is_empty(),
+        "operation {} uses raw_response with http_error_responses; typed HTTP errors are unsupported",
+        operation.name
+    );
+    anyhow::ensure!(
+        operation.cli_command.is_none()
+            && operation.cli_output_flags.is_empty()
+            && operation
+                .parameters
+                .iter()
+                .all(|parameter| parameter.cli.is_none()),
+        "operation {} uses raw_response with CLI-specific options; CLI options are unsupported",
+        operation.name
+    );
+
+    let Some(content_type) = operation.raw_response_content_type.as_deref() else {
+        anyhow::bail!(
+            "operation {} uses raw_response but declares no raw_response_content_type",
+            operation.name
+        );
+    };
+    anyhow::ensure!(
+        is_valid_raw_response_content_type(content_type),
+        "operation {} declares invalid raw_response_content_type {content_type:?}; \
+         expected an explicit ASCII MIME type/subtype token without parameters or wildcards",
+        operation.name
+    );
+    Ok(())
+}
+
+/// Accept one literal MIME type/subtype using HTTP token characters only.
+/// Wildcards are deliberately excluded even though `*` is an HTTP token.
+fn is_valid_raw_response_content_type(value: &str) -> bool {
+    let Some((media_type, subtype)) = value.split_once('/') else {
+        return false;
+    };
+    if media_type.is_empty() || subtype.is_empty() || subtype.contains('/') || !value.is_ascii() {
+        return false;
+    }
+    let is_token = |part: &str| {
+        part.bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'+-.^_`|~".contains(&byte))
+    };
+    is_token(media_type) && is_token(subtype)
 }
 
 /// Validate surface allowlists, delivery-kind rules, and CLI command names.

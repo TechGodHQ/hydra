@@ -1,0 +1,33 @@
+operations:
+  - name: fetch_bytes
+    description: Return an exact finite binary fixture response.
+    method: POST
+    path: /objects/{object_id}/bytes
+    read: false
+    output_type: Vec<u8>
+    surfaces: [http]
+    raw_response: true
+    raw_response_content_type: application/octet-stream
+    parameters:
+      - name: object_id
+        description: Fixture object identifier.
+        type: string
+        required: true
+        location: path
+      - name: mode
+        description: Select the bounded fixture payload.
+        type: string
+        required: true
+        location: query
+      - name: metadata
+        description: Synthetic fixture metadata.
+        type: json
+        required: true
+        location: body
+        schema:
+          type: object
+          properties:
+            label:
+              type: string
+          required: [label]
+          additionalProperties: false

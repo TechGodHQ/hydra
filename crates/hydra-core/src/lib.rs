@@ -116,6 +116,18 @@ pub struct Operation {
     /// values, and collapses repeated headers to the last value.
     #[serde(default)]
     pub raw_request: bool,
+    /// Opt in to a finite raw-byte response on the HTTP surface. The generated
+    /// handler still extracts declared path/query/JSON-body inputs, then calls
+    /// the consumer-owned byte dispatcher and returns its bytes without JSON
+    /// serialization. Raw responses require exactly `[http]`, unary delivery,
+    /// and an explicit `raw_response_content_type` declaration.
+    #[serde(default)]
+    pub raw_response: bool,
+    /// Explicit literal `type/subtype` Content-Type for a `raw_response`
+    /// operation. Parameters and wildcards are not supported. A value without
+    /// `raw_response: true` is invalid.
+    #[serde(default)]
+    pub raw_response_content_type: Option<String>,
 }
 
 /// Response delivery kind for a generated operation.
@@ -155,6 +167,12 @@ impl Operation {
     #[must_use]
     pub const fn is_raw_request(&self) -> bool {
         self.raw_request
+    }
+
+    /// Whether this operation returns a finite, exact byte response over HTTP.
+    #[must_use]
+    pub const fn is_raw_response(&self) -> bool {
+        self.raw_response
     }
 
     /// Whether the HTTP surface is generated for this operation.
