@@ -156,3 +156,12 @@ operations:
         cli:
           flag: event
           multiple: true
+  - name: subscribe_events
+    description: Stream deterministic synthetic note events.
+    method: GET
+    path: /events/stream
+    read: true
+    output_type: Event
+    parameters: []
+    delivery: sse
+    surfaces: [http]
