@@ -41,6 +41,12 @@ pub struct GenerateConfig {
     /// `<target>(&state, "<op>", GeneratedRawOperationInput { .. })`.
     #[serde(default = "default_http_raw_dispatch_fn")]
     pub http_raw_dispatch_fn: String,
+    /// Where generated finite raw-response handlers send their extracted
+    /// operation inputs, e.g. `super::execute_generated_raw_response`. The
+    /// consumer target returns one exact `Vec<u8>` body; Hydra fixes status
+    /// 200 and the declared Content-Type.
+    #[serde(default = "default_http_raw_response_dispatch_fn")]
+    pub http_raw_response_dispatch_fn: String,
     /// Header line identifying the generator in committed artifacts.
     #[serde(default = "default_generator_name")]
     pub generator_name: String,
@@ -55,6 +61,10 @@ fn default_sse_binding_prefix() -> String {
 
 fn default_http_raw_dispatch_fn() -> String {
     "super::execute_generated_raw_operation".to_string()
+}
+
+fn default_http_raw_response_dispatch_fn() -> String {
+    "super::execute_generated_raw_response".to_string()
 }
 
 fn default_generator_name() -> String {
@@ -72,6 +82,7 @@ impl Default for GenerateConfig {
             http_state_type: "crate::app::AppState".to_string(),
             sse_binding_prefix: default_sse_binding_prefix(),
             http_raw_dispatch_fn: default_http_raw_dispatch_fn(),
+            http_raw_response_dispatch_fn: default_http_raw_response_dispatch_fn(),
             generator_name: default_generator_name(),
             ts_client_name: default_ts_client_name(),
         }
@@ -549,6 +560,10 @@ fn push_unary_handler(out: &mut String, operation: &Operation, config: &Generate
         .parameters
         .iter()
         .any(|parameter| parameter.location == ParameterLocation::Body);
+    if operation.is_raw_response() {
+        push_raw_response_handler(out, operation, config, has_path, has_query, has_body);
+        return;
+    }
 
     out.push_str("async fn ");
     out.push_str(&operation.name);
@@ -654,6 +669,72 @@ fn push_raw_handler(
     out.push_str("        },\n");
     out.push_str("    )\n");
     out.push_str("    .await\n");
+    out.push_str("}\n");
+}
+
+/// Emit a unary handler that preserves declared typed inputs and returns the
+/// consumer dispatcher's exact finite bytes with the declaration's MIME type.
+fn push_raw_response_handler(
+    out: &mut String,
+    operation: &Operation,
+    config: &GenerateConfig,
+    has_path: bool,
+    has_query: bool,
+    has_body: bool,
+) {
+    out.push_str("async fn ");
+    out.push_str(&operation.name);
+    out.push_str("(\n");
+    push_fmt!(
+        out,
+        "    State(state): State<{}>,\n",
+        config.http_state_type
+    );
+    if has_path {
+        out.push_str("    Path(path): Path<BTreeMap<String, String>>,\n");
+    }
+    if has_query {
+        out.push_str("    Query(query): Query<BTreeMap<String, String>>,\n");
+    }
+    if has_body {
+        out.push_str("    Json(body): Json<Value>,\n");
+    }
+    out.push_str(") -> Response {\n");
+    out.push_str("    let response_body: Vec<u8> = ");
+    out.push_str(&config.http_raw_response_dispatch_fn);
+    out.push_str("(\n        &state,\n        ");
+    out.push_str(&rust_string_literal(&operation.name));
+    out.push_str(",\n        GeneratedOperationInput {\n");
+    if has_path {
+        out.push_str("            path,\n");
+    } else {
+        out.push_str("            path: BTreeMap::new(),\n");
+    }
+    if has_query {
+        out.push_str("            query,\n");
+    } else {
+        out.push_str("            query: BTreeMap::new(),\n");
+    }
+    if has_body {
+        out.push_str("            body,\n");
+    } else {
+        out.push_str("            body: Value::Null,\n");
+    }
+    out.push_str("        },\n    )\n    .await;\n");
+    out.push_str("    Response::builder()\n");
+    out.push_str("        .status(200)\n");
+    out.push_str("        .header(\"content-type\", ");
+    out.push_str(&rust_string_literal(
+        operation
+            .raw_response_content_type
+            .as_deref()
+            .expect("validated raw response must declare a Content-Type"),
+    ));
+    out.push_str(")\n");
+    out.push_str("        .body(axum::body::Body::from(response_body))\n");
+    out.push_str(
+        "        .expect(\"validated raw response Content-Type is a valid HTTP header\")\n",
+    );
     out.push_str("}\n");
 }
 

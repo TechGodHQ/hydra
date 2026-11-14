@@ -71,6 +71,8 @@ http_dispatch_fn: "crate::execute_operation_http"
 http_state_type: "crate::AppState"
 # Only needed if the definition has raw_request operations:
 # http_raw_dispatch_fn: "crate::execute_operation_raw_http"
+# Only needed if the definition has raw_response operations:
+# http_raw_response_dispatch_fn: "crate::execute_operation_raw_response"
 # Exported class name for the generated TypeScript client:
 ts_client_name: "NotesClient"
 ```
@@ -390,6 +392,61 @@ JSON body extraction. The header map lowercases names, drops non-UTF-8
 values, and collapses repeated headers to the last value. Definitions
 without raw operations generate byte-identical output to before the flag
 existed.
+
+## Raw-response (finite binary output) operations
+
+Operations that return one finite byte body can opt in with
+`raw_response: true`. Unlike `raw_request`, this preserves the ordinary
+explicit path/query/JSON-body input extraction and changes only the success
+response representation:
+
+```yaml
+- name: fetch_blob
+  description: Return the exact stored blob bytes.
+  method: GET
+  path: /blobs/{blob_id}
+  read: true
+  output_type: Vec<u8>
+  surfaces: [http]
+  raw_response: true
+  raw_response_content_type: application/octet-stream
+  parameters:
+    - name: blob_id
+      description: Blob identifier.
+      type: string
+      required: true
+      location: path
+```
+
+The generated handler passes the operation name and existing
+`GeneratedOperationInput` to the consumer's configured
+`http_raw_response_dispatch_fn`, which asynchronously returns `Vec<u8>`.
+The generated handler type-annotates its dispatch binding as `Vec<u8>`, so a
+dispatcher returning any other type (for example `axum::body::Body`) fails to
+compile. Hydra emits those bytes unchanged as one finite response with fixed
+HTTP 200
+and the declared `Content-Type`; it does not UTF-8 decode, JSON-serialize,
+base64-wrap, stream, or select dynamic status/headers. The consumer adapter
+delegates to the same common operation implementation used by other surfaces.
+Path, query, and JSON-body parameters retain their declared extraction rules.
+
+The Content-Type must be one explicit ASCII MIME `type/subtype` with nonempty
+HTTP-token components. Whitespace, control characters, parameters, and
+wildcards are rejected; Hydra never infers the value from a path, operation
+name, or `output_type`. V1 requires exactly `surfaces: [http]`, unary delivery,
+`raw_request: false`, and no CLI-specific options or typed
+`http_error_responses`. Raw request plus raw response, SSE, and CLI/MCP/
+TypeScript projection are rejected rather than degraded. Existing ordinary
+operations and raw-request behavior remain unchanged.
+
+**Rust API compatibility:** adding `raw_response` and
+`raw_response_content_type` is source-breaking for Rust callers constructing
+`Operation` with a struct literal; add `raw_response: false` and
+`raw_response_content_type: None` when opting out. Existing YAML definitions
+remain compatible because both fields have serde defaults. Adding
+`http_raw_response_dispatch_fn` is source-breaking for exhaustive Rust
+`GenerateConfig` literals; existing `hydra.yaml` files remain compatible via
+the serde default `super::execute_generated_raw_response`.
 
 ## Design rules
 
