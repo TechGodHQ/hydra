@@ -429,22 +429,20 @@ pub async fn run_cli() -> anyhow::Result<()> {
     let input = generated::GeneratedOperationInput {
         path: params
             .as_object()
-            .map(|o| {
+            .map_or_else(std::collections::BTreeMap::new, |o| {
                 o.iter()
                     .filter(|(_, v)| v.is_string())
                     .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
                     .collect()
-            })
-            .unwrap_or_default(),
+            }),
         query: params
             .as_object()
-            .map(|o| {
+            .map_or_else(std::collections::BTreeMap::new, |o| {
                 o.iter()
                     .filter(|(_, v)| v.is_number() || v.is_boolean())
                     .map(|(k, v)| (k.clone(), v.to_string()))
                     .collect()
-            })
-            .unwrap_or_default(),
+            }),
         body: params.clone(),
     };
 
