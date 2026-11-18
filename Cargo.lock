@@ -493,6 +493,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "futures-util",
  "hydra-mcp-http",
  "hydra-mcp-stdio",
  "serde",
