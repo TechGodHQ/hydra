@@ -308,9 +308,72 @@ pub struct HttpErrorField {
     /// A fixed string value supplied by the declaration rather than callers.
     ///
     /// Constants are permitted only for required fields, so optional fields
-    /// retain their `Option<String>` omission semantics.
-    #[serde(rename = "const", default, skip_serializing_if = "Option::is_none")]
+    /// retain their `Option<String>` omission semantics. The declaration must
+    /// supply a scalar string — including a quoted empty string. A null
+    /// (which is also what an unquoted empty value parses to), a boolean, a
+    /// number, a sequence, or a mapping is rejected at load time; omitting
+    /// the `const` key entirely is the way to declare a dynamic field.
+    #[serde(
+        rename = "const",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_error_field_constant"
+    )]
     pub constant: Option<String>,
+}
+
+/// Deserialize an [`HttpErrorField::constant`], rejecting explicit
+/// non-string YAML values.
+///
+/// Plain `Option<String>` deserialization accepts malformed declarations
+/// silently: YAML null — including an unquoted empty value — becomes `None`,
+/// flipping a declared constant into a dynamic field, while booleans and
+/// numbers are stringified into constants that are not the declared
+/// strings. Accepting only scalar strings makes those declarations fail
+/// where the definition source is still in scope, so the file path, YAML
+/// field path, and location travel with the error.
+fn deserialize_error_field_constant<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer.deserialize_any(ConstantVisitor)
+}
+
+/// Message for a `const` key whose YAML value is null or an empty scalar.
+const NULL_CONSTANT_MESSAGE: &str = "`const` value is null or empty; a \
+     constant must be a string — omit the `const` key to declare a dynamic \
+     field";
+
+/// Visitor for [`deserialize_error_field_constant`]: scalar strings only.
+struct ConstantVisitor;
+
+impl serde::de::Visitor<'_> for ConstantVisitor {
+    type Value = Option<String>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a string constant")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Some(value.to_owned()))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Err(E::custom(NULL_CONSTANT_MESSAGE))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Err(E::custom(NULL_CONSTANT_MESSAGE))
+    }
 }
 
 /// Field types supported by typed HTTP error responses.

@@ -1527,3 +1527,108 @@ operations:
         "v1 error fields support only declared string values"
     );
 }
+
+#[test]
+fn http_error_response_yaml_rejects_non_string_constants() {
+    let base = r"
+operations:
+  - name: status
+    description: Read status.
+    method: GET
+    path: /status
+    read: true
+    output_type: Status
+    parameters: []
+    http_error_responses:
+      - name: unavailable
+        status: 503
+        fields:
+          - name: error
+            type: string
+            required: true
+";
+    let with_const = |line: &str| format!("{base}            {line}\n");
+
+    // Explicit non-string values are malformed constants: parsing must
+    // reject them instead of stringifying booleans/numbers into constants
+    // that are not the declared strings, or treating null (and an unquoted
+    // empty value) as an omitted dynamic field.
+    for line in [
+        "const: null",
+        "const:",
+        "const: ~",
+        "const: true",
+        "const: false",
+        "const: 5",
+        "const: 5.5",
+        "const: -3",
+        "const: [a]",
+        "const: {k: v}",
+    ] {
+        let error = serde_yaml::from_str::<ApiDefinition>(&with_const(line))
+            .expect_err("non-string constants must be rejected at parse time");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("operations[0].http_error_responses[0].fields[0].const"),
+            "error must name the offending field path for {line:?}: {rendered}"
+        );
+    }
+
+    // Null forms point at the dynamic-field declaration instead.
+    for line in ["const: null", "const:", "const: ~"] {
+        let error = serde_yaml::from_str::<ApiDefinition>(&with_const(line))
+            .expect_err("null constants must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("omit the `const` key to declare a dynamic field"),
+            "null-form error must guide toward omission for {line:?}: {error}"
+        );
+    }
+
+    // Typed values name the expected declaration shape.
+    for line in ["const: true", "const: 5", "const: [a]", "const: {k: v}"] {
+        let error = serde_yaml::from_str::<ApiDefinition>(&with_const(line))
+            .expect_err("typed constants must be rejected");
+        assert!(
+            error.to_string().contains("expected a string constant"),
+            "typed-value error must state the expectation for {line:?}: {error}"
+        );
+    }
+
+    // An omitted key stays dynamic; plain and quoted scalars — including a
+    // quoted empty string and quoted non-string lookalikes — stay constants.
+    let dynamic: ApiDefinition = serde_yaml::from_str(base).expect("omitted const parses");
+    assert_eq!(
+        dynamic.operations[0].http_error_responses[0].fields[0].constant,
+        None
+    );
+    for (line, expected) in [
+        ("const: unavailable", "unavailable"),
+        (r#"const: """#, ""),
+        ("const: ''", ""),
+        (r#"const: "5""#, "5"),
+        ("const: 'true'", "true"),
+        (r#"const: "null""#, "null"),
+    ] {
+        let definition: ApiDefinition =
+            serde_yaml::from_str(&with_const(line)).expect("string constants parse");
+        assert_eq!(
+            definition.operations[0].http_error_responses[0].fields[0].constant,
+            Some(expected.to_owned()),
+            "declaration {line:?} must parse as the exact string {expected:?}"
+        );
+    }
+
+    // The serializer quotes constants that would otherwise resolve to
+    // booleans, numbers, or null, so the stricter deserializer cannot break
+    // value round-trips.
+    let mut round_trip = dynamic;
+    round_trip.operations[0].http_error_responses[0].fields[0].constant = Some("true".into());
+    let serialized = serde_yaml::to_string(&round_trip).expect("serialize definition");
+    let reparsed: ApiDefinition = serde_yaml::from_str(&serialized).expect("round-trip parses");
+    assert_eq!(
+        reparsed.operations[0].http_error_responses[0].fields[0].constant,
+        Some("true".to_owned())
+    );
+}
