@@ -211,7 +211,12 @@ are omitted rather than serialized as `null` when `None`.
 V1 is intentionally closed: error names and field names are Rust-safe
 `snake_case`; field names are the exact flat JSON keys; `type: string` is the
 only supported field type; statuses must be 400 through 599; and `const` is a
-string allowed only on required fields. Hydra rejects unknown keys, duplicate
+string allowed only on required fields. A supplied `const` must be a string
+scalar: the loader rejects null (including an unquoted empty value), booleans,
+numbers, lists, and mappings — each rejection names the definition file, the
+operation, the response, the field, and the `const` key — while quoted scalars
+(including a quoted empty string) are valid declaration data and an omitted
+`const` key keeps the field dynamic. Hydra rejects unknown keys, duplicate
 names, invalid statuses, generated-symbol collisions, and declarations on
 operations without HTTP generation before code generation. The declaration
 does not alter request inputs, CLI arguments, MCP schemas, unary route
