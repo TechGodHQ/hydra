@@ -1979,6 +1979,36 @@ fn http_error_response_fixture_with_optional_constant(constant: &str) -> String 
     )
 }
 
+/// The required and optional field scopes must both reject a supplied empty
+/// string constant at the loader boundary, with the declaration identified.
+fn assert_quoted_empty_string_const_rejected(temp: &tempfile::TempDir) {
+    for (scope, field_name) in [("required", "error"), ("optional", "retry_hint")] {
+        let yaml = match scope {
+            "required" => http_error_response_fixture_with_required_constant("\"\""),
+            "optional" => http_error_response_fixture_with_optional_constant("\"\""),
+            _ => unreachable!("test scope is fixed"),
+        };
+        let fixture =
+            write_http_error_response_loader_fixture(temp, &format!("{scope}-quoted-empty"), &yaml);
+        let error = hydra_core::load_api_definition(&fixture).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(&fixture.display().to_string()),
+            "{scope} empty-string error must identify the definition source: {rendered}"
+        );
+        assert!(
+            rendered.contains("declares const as an empty string"),
+            "{scope} empty-string error must identify const: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "operation read_events HTTP error response rate_limited field {field_name}"
+            )),
+            "{scope} empty-string error must identify the operation, response, and field: {rendered}"
+        );
+    }
+}
+
 #[test]
 fn http_error_constant_loader_distinguishes_omission_from_explicit_non_strings() {
     let temp = tempfile::tempdir().expect("temporary loader fixture directory");
@@ -2009,10 +2039,10 @@ fn http_error_constant_loader_distinguishes_omission_from_explicit_non_strings()
         "pub fn rate_limited(retry_after: String, retry_hint: Option<String>) -> RateLimitedResponse"
     ));
 
-    // Quoted scalar text is valid declaration data, including empty strings;
-    // it remains fixed rather than becoming a generated constructor argument.
+    // Quoted scalar text is valid declaration data, so long as it carries
+    // content; it remains fixed rather than becoming a generated constructor
+    // argument.
     for (name, declaration, expected) in [
-        ("empty-string", "\"\"", ""),
         ("quoted-numeric", "\"42\"", "42"),
         ("quoted-boolean", "\"true\"", "true"),
     ] {
@@ -2033,6 +2063,11 @@ fn http_error_constant_loader_distinguishes_omission_from_explicit_non_strings()
             "pub fn rate_limited(retry_after: String, retry_hint: Option<String>) -> RateLimitedResponse"
         ));
     }
+
+    // A supplied empty string declares no fixed value; it must stop at
+    // load_api_definition before generation, for both required and optional
+    // fields.
+    assert_quoted_empty_string_const_rejected(&temp);
 
     // Every supplied non-string form must stop at load_api_definition before
     // generation, for both required and optional fields.
