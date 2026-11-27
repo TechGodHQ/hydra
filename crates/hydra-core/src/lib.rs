@@ -457,13 +457,16 @@ pub fn load_api_definition(path: impl AsRef<Path>) -> Result<ApiDefinition> {
     Ok(definition)
 }
 
-/// Reject supplied non-string HTTP-error constants with declaration names.
+/// Reject supplied non-string and empty HTTP-error constants with declaration
+/// names.
 ///
 /// The public model intentionally keeps `constant` as `Option<String>` for
 /// programmatic construction. Inspecting the raw YAML before typed
 /// deserialization preserves the otherwise-lost distinction between an absent
 /// key and an explicit YAML null while giving users named operation, response,
-/// and field diagnostics.
+/// and field diagnostics. A supplied constant must carry content: an explicit
+/// empty string declares no fixed value, so it is rejected alongside
+/// non-string values rather than silently emitted as an empty constant.
 fn validate_http_error_constant_declarations(definition: &serde_yaml::Value) -> Result<()> {
     let Some(root) = definition.as_mapping() else {
         return Ok(());
@@ -513,12 +516,16 @@ fn validate_http_error_constant_declarations(definition: &serde_yaml::Value) -> 
                 let field_name = yaml_mapping_value(field, "name")
                     .and_then(serde_yaml::Value::as_str)
                     .map_or_else(|| format!("fields[{field_index}]"), ToOwned::to_owned);
-                if let Some(constant) = yaml_mapping_value(field, "const")
-                    && !matches!(constant, serde_yaml::Value::String(_))
-                {
-                    anyhow::bail!(
-                        "operation {operation_name} HTTP error response {response_name} field {field_name} declares const with a non-string value; const must be a string when supplied"
-                    );
+                if let Some(constant) = yaml_mapping_value(field, "const") {
+                    match constant {
+                        serde_yaml::Value::String(value) if !value.is_empty() => {}
+                        serde_yaml::Value::String(_) => anyhow::bail!(
+                            "operation {operation_name} HTTP error response {response_name} field {field_name} declares const as an empty string; omit the key to leave the field dynamic"
+                        ),
+                        _ => anyhow::bail!(
+                            "operation {operation_name} HTTP error response {response_name} field {field_name} declares const with a non-string value; const must be a string when supplied"
+                        ),
+                    }
                 }
             }
         }
