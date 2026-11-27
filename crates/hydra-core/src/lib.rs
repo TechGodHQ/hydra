@@ -386,11 +386,20 @@ pub enum ParameterLocation {
 }
 
 /// Load an API definition from YAML.
+///
+/// HTTP-error `const` declarations are gated against the raw YAML form before
+/// typed parsing: an omitted key and an unquoted empty value both deserialize
+/// to `Option::None`, and unquoted booleans and numbers coerce into strings,
+/// so only the raw form can reject those declarations while naming the
+/// definition file path and the offending field's `const` key.
 pub fn load_api_definition(path: impl AsRef<Path>) -> Result<ApiDefinition> {
     let path = path.as_ref();
     let raw = fs::read_to_string(path)
         .with_context(|| format!("read API definition from {}", path.display()))?;
-    let definition: ApiDefinition = serde_yaml::from_str(&raw)
+    let raw_value: serde_yaml::Value = serde_yaml::from_str(&raw)
+        .with_context(|| format!("parse API definition from {}", path.display()))?;
+    validate::validate_http_error_constant_declarations(&raw_value, path)?;
+    let definition: ApiDefinition = serde_yaml::from_value(raw_value)
         .with_context(|| format!("parse API definition from {}", path.display()))?;
     validate::validate_definition(&definition)?;
     Ok(definition)

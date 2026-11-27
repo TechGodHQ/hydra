@@ -6,7 +6,10 @@
 //! parameters, names must be collision-free, and surface allowlists must be
 //! self-consistent.
 
+use std::path::Path;
+
 use anyhow::Result;
+use serde_yaml::Value;
 
 use crate::{
     ApiDefinition, GENERATED_HTTP_RESERVED_NAMES, HttpErrorFieldType, HttpMethod, Operation,
@@ -329,6 +332,93 @@ fn validate_operation_http_error_responses(operation: &Operation) -> Result<()> 
     }
 
     Ok(())
+}
+
+/// Validate HTTP-error `const` declarations against the raw YAML form.
+///
+/// Typed parsing collapses YAML distinctions that carry contract meaning: an
+/// omitted `const` key and an unquoted empty `const:` both deserialize to
+/// `Option::None`, and unquoted booleans and numbers coerce into strings
+/// (`const: true` becomes `"true"`). This walk runs at load time on the
+/// parsed-but-untyped value, before typed parsing, so every rejected
+/// declaration names the definition file path and the offending field's
+/// `const` key. Omitted keys, string scalars (including quoted empty and
+/// quoted boolean/number-looking scalars), and constants on `required: true`
+/// fields pass through unchanged.
+pub fn validate_http_error_constant_declarations(
+    raw: &Value,
+    definition_path: &Path,
+) -> Result<()> {
+    let Some(operations) = raw.get("operations").and_then(Value::as_sequence) else {
+        return Ok(());
+    };
+    for operation in operations {
+        let operation_name = scalar_name(operation, "name");
+        let Some(responses) = operation
+            .get("http_error_responses")
+            .and_then(Value::as_sequence)
+        else {
+            continue;
+        };
+        for response in responses {
+            let response_name = scalar_name(response, "name");
+            let Some(fields) = response.get("fields").and_then(Value::as_sequence) else {
+                continue;
+            };
+            for field in fields {
+                let Some(const_value) = field.get("const") else {
+                    continue;
+                };
+                let field_name = scalar_name(field, "name");
+                anyhow::ensure!(
+                    const_value.is_string(),
+                    "{}: operation {} HTTP error response {} field {} declares const with {}; const must be a string scalar; quote the value (const: \"...\") or omit the key to keep the field dynamic",
+                    definition_path.display(),
+                    operation_name,
+                    response_name,
+                    field_name,
+                    describe_const_value(const_value)
+                );
+                anyhow::ensure!(
+                    field
+                        .get("required")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    "{}: operation {} HTTP error response {} field {} declares const but is optional; constants require required: true",
+                    definition_path.display(),
+                    operation_name,
+                    response_name,
+                    field_name
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Describe the YAML type of an offending `const` value for error messages.
+fn describe_const_value(value: &Value) -> String {
+    match value {
+        Value::Null => "an empty unquoted value (null)".to_owned(),
+        Value::Bool(value) => format!("a boolean value ({value})"),
+        Value::Number(value) => format!("a number value ({value})"),
+        Value::Sequence(_) => "a sequence value".to_owned(),
+        Value::Mapping(_) => "a mapping value".to_owned(),
+        Value::Tagged(_) => "a tagged value".to_owned(),
+        Value::String(value) => format!("a string value (\"{value}\")"),
+    }
+}
+
+/// Read a `name`-style scalar out of a raw YAML mapping for error messages.
+///
+/// Malformed names leave the typed parse to report its own structured error;
+/// this only keeps rejection messages pointing at something identifiable.
+fn scalar_name<'a>(value: &'a Value, key: &str) -> &'a str {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>")
 }
 
 /// Reject collisions between generated HTTP-error module names and existing
