@@ -2,8 +2,9 @@
 //! generated surfaces.
 //!
 //! An [`ApiDefinition`] is the single source of truth for a project's
-//! operations. Hydra projects it onto three surfaces — CLI (clap), HTTP
-//! (axum), and MCP (tool schemas + stdio runtime) — without name-based
+//! operations. Hydra projects it onto four surfaces — CLI (clap), HTTP
+//! (axum), MCP (tool schemas + stdio runtime), and a fetch-based TypeScript
+//! client — without name-based
 //! inference: every route, parameter location, and surface allowlist is
 //! declared explicitly, so the generated contract cannot drift from the
 //! generated router.
@@ -14,7 +15,7 @@
 use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as DeError};
 
 pub mod paths;
 pub mod validate;
@@ -115,6 +116,18 @@ pub struct Operation {
     /// values, and collapses repeated headers to the last value.
     #[serde(default)]
     pub raw_request: bool,
+    /// Opt in to a finite raw-byte response on the HTTP surface. The generated
+    /// handler still extracts declared path/query/JSON-body inputs, then calls
+    /// the consumer-owned byte dispatcher and returns its bytes without JSON
+    /// serialization. Raw responses require exactly `[http]`, unary delivery,
+    /// and an explicit `raw_response_content_type` declaration.
+    #[serde(default)]
+    pub raw_response: bool,
+    /// Explicit literal `type/subtype` Content-Type for a `raw_response`
+    /// operation. Parameters and wildcards are not supported. A value without
+    /// `raw_response: true` is invalid.
+    #[serde(default)]
+    pub raw_response_content_type: Option<String>,
 }
 
 /// Response delivery kind for a generated operation.
@@ -130,7 +143,7 @@ pub enum Delivery {
 
 /// A generated surface an operation may be exposed on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Surface {
     /// The HTTP REST surface.
     Http,
@@ -138,6 +151,8 @@ pub enum Surface {
     Cli,
     /// The MCP tool surface.
     Mcp,
+    /// The fetch-based TypeScript client surface.
+    TsClient,
 }
 
 impl Operation {
@@ -152,6 +167,12 @@ impl Operation {
     #[must_use]
     pub const fn is_raw_request(&self) -> bool {
         self.raw_request
+    }
+
+    /// Whether this operation returns a finite, exact byte response over HTTP.
+    #[must_use]
+    pub const fn is_raw_response(&self) -> bool {
+        self.raw_response
     }
 
     /// Whether the HTTP surface is generated for this operation.
@@ -176,6 +197,17 @@ impl Operation {
         self.surfaces
             .as_ref()
             .is_none_or(|surfaces| surfaces.contains(&Surface::Mcp))
+    }
+
+    /// Whether the TypeScript client surface is generated for this operation.
+    /// Unary operations with no explicit allowlist opt in by default; SSE
+    /// operations stay out until a streaming TypeScript contract exists.
+    #[must_use]
+    pub fn generates_ts_client(&self) -> bool {
+        self.surfaces.as_ref().map_or_else(
+            || !self.is_sse(),
+            |surfaces| surfaces.contains(&Surface::TsClient),
+        )
     }
 }
 
@@ -308,11 +340,7 @@ pub struct HttpErrorField {
     /// A fixed string value supplied by the declaration rather than callers.
     ///
     /// Constants are permitted only for required fields, so optional fields
-    /// retain their `Option<String>` omission semantics. A supplied `const`
-    /// must be a string scalar: the loader rejects YAML null (including an
-    /// unquoted empty value), booleans, numbers, lists, and mappings, while
-    /// an omitted key keeps the field dynamic and quoted scalars — including
-    /// a quoted empty string — stay valid declaration data.
+    /// retain their `Option<String>` omission semantics.
     #[serde(
         rename = "const",
         default,
@@ -322,38 +350,22 @@ pub struct HttpErrorField {
     pub constant: Option<String>,
 }
 
-/// Deserialize a supplied HTTP-error constant without collapsing an explicit
+/// Deserialize a declared HTTP-error constant without collapsing an explicit
 /// YAML null into an omitted declaration.
 ///
-/// `default` supplies `None` only when the `const` key is absent, so a
-/// supplied key must deserialize as a string: null and every other
-/// non-string node fail at the deserialization boundary instead of silently
-/// becoming a dynamic field or a stringified constant. The raw-value guard
-/// in [`load_api_definition`] reports the path-naming diagnostic first; this
-/// visitor is the backstop for typed parsing that bypasses the loader.
+/// `default` supplies `None` only when the `const` key is absent. A supplied
+/// key must deserialize as a string, so YAML null and every non-string node
+/// fail at the definition-loader boundary rather than becoming a dynamic
+/// generated constructor argument.
 fn deserialize_http_error_constant<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
     match serde_yaml::Value::deserialize(deserializer)? {
         serde_yaml::Value::String(value) => Ok(Some(value)),
-        other => Err(D::Error::custom(format!(
-            "HTTP error field `const` must be a string when supplied, found {}",
-            yaml_value_kind(&other)
-        ))),
-    }
-}
-
-/// Human name for a YAML value's shape, used in rejection diagnostics.
-const fn yaml_value_kind(value: &serde_yaml::Value) -> &'static str {
-    match value {
-        serde_yaml::Value::Null => "null",
-        serde_yaml::Value::Bool(_) => "boolean",
-        serde_yaml::Value::Number(_) => "number",
-        serde_yaml::Value::String(_) => "string",
-        serde_yaml::Value::Sequence(_) => "list",
-        serde_yaml::Value::Mapping(_) => "mapping",
-        serde_yaml::Value::Tagged(_) => "tagged",
+        _ => Err(D::Error::custom(
+            "HTTP error field const must be a string when supplied",
+        )),
     }
 }
 
@@ -430,86 +442,91 @@ pub enum ParameterLocation {
 }
 
 /// Load an API definition from YAML.
-///
-/// Beyond reading and parsing, the loader gates declared HTTP-error
-/// constants against the raw YAML form (see
-/// [`validate_http_error_constant_declarations`]) so malformed `const`
-/// values are rejected with diagnostics that name the definition file
-/// before typed parsing can absorb them.
 pub fn load_api_definition(path: impl AsRef<Path>) -> Result<ApiDefinition> {
     let path = path.as_ref();
     let raw = fs::read_to_string(path)
         .with_context(|| format!("read API definition from {}", path.display()))?;
     let raw_definition: serde_yaml::Value = serde_yaml::from_str(&raw)
         .with_context(|| format!("parse API definition from {}", path.display()))?;
-    validate_http_error_constant_declarations(&raw_definition, path)?;
+    validate_http_error_constant_declarations(&raw_definition)
+        .with_context(|| format!("validate HTTP error constants in {}", path.display()))?;
     let definition: ApiDefinition = serde_yaml::from_str(&raw)
         .with_context(|| format!("parse API definition from {}", path.display()))?;
-    validate::validate_definition(&definition)?;
+    validate::validate_definition(&definition)
+        .with_context(|| format!("validate API definition from {}", path.display()))?;
     Ok(definition)
 }
 
-/// Reject malformed `const` declarations on HTTP error response fields
-/// before typed parsing can absorb them.
+/// Reject supplied non-string and empty HTTP-error constants with declaration
+/// names.
 ///
-/// The typed model stores constants as `Option<String>`, which cannot
-/// represent the malformed forms this guard exists to catch: an explicit
-/// YAML null (including an unquoted empty value) collapses to the same
-/// `None` as an omitted key, and `serde_yaml` deserializes unquoted booleans
-/// and numbers into strings (`const: 42` would become `Some("42")`).
-/// Inspecting the raw YAML value keeps those distinctions, so every
-/// rejection names the definition file path and the field's `const` key:
-///
-/// - a null, boolean, number, list, or mapping `const` value is rejected;
-/// - a `const` on a field that is not `required: true` is rejected;
-/// - an omitted `const` key remains a dynamic field, and quoted scalars —
-///   including a quoted empty string — remain valid declaration data.
-fn validate_http_error_constant_declarations(
-    definition: &serde_yaml::Value,
-    path: &Path,
-) -> Result<()> {
-    let Some(operations) = definition
-        .as_mapping()
-        .and_then(|root| yaml_mapping_value(root, "operations"))
-        .and_then(serde_yaml::Value::as_sequence)
+/// The public model intentionally keeps `constant` as `Option<String>` for
+/// programmatic construction. Inspecting the raw YAML before typed
+/// deserialization preserves the otherwise-lost distinction between an absent
+/// key and an explicit YAML null while giving users named operation, response,
+/// and field diagnostics. A supplied constant must carry content: an explicit
+/// empty string declares no fixed value, so it is rejected alongside
+/// non-string values rather than silently emitted as an empty constant.
+fn validate_http_error_constant_declarations(definition: &serde_yaml::Value) -> Result<()> {
+    let Some(root) = definition.as_mapping() else {
+        return Ok(());
+    };
+    let Some(operations) =
+        yaml_mapping_value(root, "operations").and_then(serde_yaml::Value::as_sequence)
     else {
         return Ok(());
     };
 
     for (operation_index, operation) in operations.iter().enumerate() {
-        let Some(operation_mapping) = operation.as_mapping() else {
+        let Some(operation) = operation.as_mapping() else {
             continue;
         };
-        let operation_name =
-            yaml_declared_name(operation, format!("operations[{operation_index}]"));
-        let Some(responses) = yaml_mapping_value(operation_mapping, "http_error_responses")
+        let operation_name = yaml_mapping_value(operation, "name")
+            .and_then(serde_yaml::Value::as_str)
+            .map_or_else(
+                || format!("operations[{operation_index}]"),
+                ToOwned::to_owned,
+            );
+        let Some(responses) = yaml_mapping_value(operation, "http_error_responses")
             .and_then(serde_yaml::Value::as_sequence)
         else {
             continue;
         };
 
         for (response_index, response) in responses.iter().enumerate() {
-            let Some(response_mapping) = response.as_mapping() else {
+            let Some(response) = response.as_mapping() else {
                 continue;
             };
-            let response_name =
-                yaml_declared_name(response, format!("http_error_responses[{response_index}]"));
-            let Some(fields) = yaml_mapping_value(response_mapping, "fields")
-                .and_then(serde_yaml::Value::as_sequence)
+            let response_name = yaml_mapping_value(response, "name")
+                .and_then(serde_yaml::Value::as_str)
+                .map_or_else(
+                    || format!("http_error_responses[{response_index}]"),
+                    ToOwned::to_owned,
+                );
+            let Some(fields) =
+                yaml_mapping_value(response, "fields").and_then(serde_yaml::Value::as_sequence)
             else {
                 continue;
             };
 
             for (field_index, field) in fields.iter().enumerate() {
-                let field_name = yaml_declared_name(field, format!("fields[{field_index}]"));
-                let label = format!(
-                    "{}: operation {} HTTP error response {} field {}",
-                    path.display(),
-                    operation_name,
-                    response_name,
-                    field_name
-                );
-                validate_http_error_field_constant(field, &label)?;
+                let Some(field) = field.as_mapping() else {
+                    continue;
+                };
+                let field_name = yaml_mapping_value(field, "name")
+                    .and_then(serde_yaml::Value::as_str)
+                    .map_or_else(|| format!("fields[{field_index}]"), ToOwned::to_owned);
+                if let Some(constant) = yaml_mapping_value(field, "const") {
+                    match constant {
+                        serde_yaml::Value::String(value) if !value.is_empty() => {}
+                        serde_yaml::Value::String(_) => anyhow::bail!(
+                            "operation {operation_name} HTTP error response {response_name} field {field_name} declares const as an empty string; omit the key to leave the field dynamic"
+                        ),
+                        _ => anyhow::bail!(
+                            "operation {operation_name} HTTP error response {response_name} field {field_name} declares const with a non-string value; const must be a string when supplied"
+                        ),
+                    }
+                }
             }
         }
     }
@@ -517,59 +534,7 @@ fn validate_http_error_constant_declarations(
     Ok(())
 }
 
-/// Validate one declared field's `const` entry against its raw YAML form.
-///
-/// The label already carries the definition file path and the operation,
-/// response, and field names; rejection messages append the `const` key and
-/// the offending form.
-fn validate_http_error_field_constant(field: &serde_yaml::Value, label: &str) -> Result<()> {
-    let Some(mapping) = field.as_mapping() else {
-        return Ok(());
-    };
-    let Some(constant) = yaml_mapping_value(mapping, "const") else {
-        return Ok(());
-    };
-
-    match constant {
-        serde_yaml::Value::String(_) => {}
-        serde_yaml::Value::Null => anyhow::bail!(
-            "{label} declares `const` with a null value; write a quoted string (an empty \"\" \
-             is allowed) or omit the key to keep the field dynamic"
-        ),
-        serde_yaml::Value::Bool(value) => anyhow::bail!(
-            "{label} declares `const` with a boolean value ({value}); `const` must be a string"
-        ),
-        serde_yaml::Value::Number(value) => anyhow::bail!(
-            "{label} declares `const` with a number value ({value}); `const` must be a string"
-        ),
-        serde_yaml::Value::Sequence(_) => {
-            anyhow::bail!("{label} declares `const` with a list; `const` must be a string");
-        }
-        serde_yaml::Value::Mapping(_) => {
-            anyhow::bail!("{label} declares `const` with a mapping; `const` must be a string");
-        }
-        serde_yaml::Value::Tagged(_) => {
-            anyhow::bail!("{label} declares `const` with a tagged value; `const` must be a string")
-        }
-    }
-
-    anyhow::ensure!(
-        yaml_mapping_value(mapping, "required") == Some(&serde_yaml::Value::Bool(true)),
-        "{label} declares `const` but is optional; constants require required: true"
-    );
-    Ok(())
-}
-
-/// The declared `name` of a YAML mapping node, or a positional fallback when
-/// the node or its name cannot be read as a string.
-fn yaml_declared_name(node: &serde_yaml::Value, fallback: String) -> String {
-    node.as_mapping()
-        .and_then(|mapping| yaml_mapping_value(mapping, "name"))
-        .and_then(serde_yaml::Value::as_str)
-        .map_or_else(|| fallback, ToOwned::to_owned)
-}
-
-/// Look up a string key in a YAML mapping without coercing the value.
+/// Look up a string key in a YAML mapping without coercing YAML values.
 fn yaml_mapping_value<'a>(
     mapping: &'a serde_yaml::Mapping,
     key: &str,

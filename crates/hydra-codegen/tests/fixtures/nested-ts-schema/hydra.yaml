@@ -1,0 +1,3 @@
+http_dispatch_fn: "crate::unused_dispatch"
+http_state_type: "crate::UnusedState"
+ts_client_name: "NestedSchemaClient"

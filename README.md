@@ -1,9 +1,9 @@
 # hydra
 
 One API definition, many surfaces. Hydra projects a single, explicit
-`api/operations.yaml` onto three committed surfaces — CLI (clap), HTTP
-(axum), and MCP (tool schemas + stdio runtime) — so the same Rust operation
-implementation powers every interface without drift.
+`api/operations.yaml` onto four committed surfaces — CLI (clap), HTTP
+(axum), MCP (tool schemas + stdio runtime), and a fetch-based TypeScript
+client — so the same operation contract powers every interface without drift.
 
 Extracted from [iris](https://github.com/TechGodHQ/iris)'s `iris-codegen`,
 generalized for reuse across TechGodHQ Rust projects. Born from a spike that
@@ -16,13 +16,13 @@ inference — everything is declared**.
                         |
               cargo run -p hydra-codegen -- write
                         |
-        +---------------+----------------+
-        |               |                |
-   generated/cli.rs  generated/http.rs  generated/mcp.json
-        |               |                |
-   clap structs     axum routes      tool schemas
-        |               |                |
-        +---------------+----------------+
+        +---------------+----------------+----------------------+
+        |               |                |                      |
+   generated/cli.rs  generated/http.rs  generated/mcp.json  generated/ts-client/index.ts
+        |               |                |                      |
+   clap structs     axum routes      tool schemas          fetch SDK
+        |               |                |                      |
+        +---------------+----------------+----------------------+
                         |
             your operation dispatch (one function)
 ```
@@ -36,7 +36,13 @@ inference — everything is declared**.
 - `hydra-mcp-stdio` — a minimal reusable MCP stdio server (JSON-RPC 2.0,
   newline-delimited) you hand your generated tool schemas and one dispatch
   closure.
-- `examples/notes` — a complete three-surface project. Copy it as a template.
+- `hydra-mcp-http` — a reusable, stateless MCP Streamable HTTP server for the
+  `2026-07-28` profile. It validates explicit per-request metadata, mirrored
+  method/name headers, and an explicit Origin policy, then calls one
+  consumer-owned async dispatch closure.
+- `examples/notes` — a complete four-surface project. Copy it as a template.
+- `examples/ts-client` — a TypeScript-only Iris consumer fixture with
+  `tsc --noEmit` coverage.
 
 ## Usage
 
@@ -65,17 +71,86 @@ http_dispatch_fn: "crate::execute_operation_http"
 http_state_type: "crate::AppState"
 # Only needed if the definition has raw_request operations:
 # http_raw_dispatch_fn: "crate::execute_operation_raw_http"
+# Only needed if the definition has raw_response operations:
+# http_raw_response_dispatch_fn: "crate::execute_operation_raw_response"
+# Exported class name for the generated TypeScript client:
+ts_client_name: "NotesClient"
 ```
 
 3. Generate and commit:
 
 ```bash
-cargo run -p hydra-codegen -- write   # writes generated/{cli.rs,http.rs,mcp.json}
+cargo run -p hydra-codegen -- write   # writes generated/{cli.rs,http.rs,mcp.json,ts-client/index.ts}
 cargo run -p hydra-codegen -- check   # CI guard: fails if artifacts are stale
 ```
 
 4. `include!` the generated files, implement one dispatch function, and wire
    your binaries. See `examples/notes/src/lib.rs`.
+
+### Stateless MCP Streamable HTTP
+
+`hydra-mcp-http` is an embedded-host runtime, not a standalone service. The
+host owns the listener and nests the returned router at an explicit path. The
+reference Notes consumer mounts it at `/mcp`:
+
+```bash
+cargo run -p notes-example --bin notes-mcp-http
+```
+
+The Notes binary binds only to `127.0.0.1:8942` and prints the local endpoint.
+A current-protocol client sends one JSON-RPC request per POST with:
+
+- `Content-Type: application/json`;
+- an `Accept` value explicitly containing both `application/json` and
+  `text/event-stream`;
+- `MCP-Protocol-Version: 2026-07-28`;
+- `Mcp-Method` matching the JSON-RPC method; and
+- `params._meta` containing
+  `io.modelcontextprotocol/protocolVersion` and
+  `io.modelcontextprotocol/clientCapabilities`.
+
+`tools/call` additionally mirrors `params.name` through `Mcp-Name`. Names that
+cannot be represented as a safe plain header use the MCP Base64 sentinel form
+`=?base64?{value}?=`. The runtime validates the generated tool manifest at
+construction, preserves its exact order and objects for `tools/list`, and
+rejects unsupported `x-mcp-header` annotations rather than advertising a
+contract it cannot validate.
+
+The default `OriginPolicy::RejectPresented` permits non-browser clients that
+omit `Origin` and rejects every presented Origin. Hosts that deliberately need
+browser-origin validation must provide a finite `OriginPolicy::AllowExact`
+list and own any separately reviewed CORS or Private Network Access layer.
+This runtime emits no CORS/PNA headers, handles no `OPTIONS` preflights, does
+not create sessions or `Mcp-Session-Id` headers, has no GET stream, and does
+not downgrade to the legacy `initialize` protocol. It also never binds a
+listener, chooses a mount path, or implements consumer operation semantics.
+
+The reproducible reference checks are:
+
+```bash
+cargo test --locked -p hydra-mcp-http
+cargo test --locked -p notes-example --test mcp_http -- --nocapture
+```
+
+The second command starts an isolated ephemeral loopback listener and drives it
+with an independent HTTP client fixture. It prints the actual synthetic
+`server/discover` → `tools/list` → `tools/call` responses, then the rejected
+Origin/name/undeclared-tool responses and a fixture-state before/after check;
+this is real TCP traffic, not a `Router::oneshot`-only transcript. It requires
+no manually running service or credentials.
+
+For the standalone reference host, start it with
+`cargo run --locked -p notes-example --bin notes-mcp-http`. It binds only to
+`127.0.0.1:8942`; stop that sample process with Ctrl-C. The example host owns
+the listener lifecycle; the generic router has no listener or MCP session to
+shut down. Embedding applications must wire their own process signal and
+listener shutdown policy. The transport does not implement protocol-level
+DELETE session termination.
+
+A consumer dispatch error is returned as client-visible tool text. Consumer
+implementations are responsible for returning only safe, value-free public
+messages; do not forward secrets, raw request/configuration data, or internal
+error details.
 
 ### JSON batch operations
 
@@ -118,6 +193,57 @@ dispatch function parses that explicit CLI representation before typed
 validation and persistence. Hydra does not own source-specific event models,
 batch hashing, idempotency, or transactions. `examples/notes` contains a
 tested `ingest_batch` reference operation and is the pattern Iris should use.
+
+### Fetch-based TypeScript client
+
+The fourth surface emits `generated/ts-client/index.ts`, a zero-runtime-
+dependency SDK that uses the platform `fetch` API. It exports one typed
+parameter interface and result alias per unary operation, plus a configured
+client class:
+
+```yaml
+- name: list_threads
+  description: List conversation threads.
+  method: GET
+  path: /threads
+  read: true
+  output_type: Vec<Thread>
+  surfaces: [ts_client]
+  parameters:
+    - name: limit
+      description: Maximum number of threads.
+      type: u32
+      required: false
+      location: query
+```
+
+Parameter `location` is the complete request mapping: path values are
+`encodeURIComponent`-escaped, query values are written only when present, and
+body values are serialized as JSON using their declared wire keys. JSON
+parameters are projected from their explicit JSON Schema (including optional
+object fields, arrays, and unions), never from parameter names. `u32` and
+other numeric definitions map to TypeScript `number`; this is intentionally
+documented as an IEEE-754 precision boundary for `i64`-sized values.
+
+Construct the generated client with `{ baseUrl, token?, fetch? }`. `token`,
+when supplied, becomes a bearer `Authorization` header; `fetch` is injectable
+for tests and non-browser runtimes. Non-2xx responses throw `ApiError` with
+the status and parsed response body. The current output model only carries
+named output type strings, not domain schemas, so named result models are
+generated as opaque `Record<string, unknown>` aliases for the consumer to
+refine. Unary operations with `surfaces: null` include the TypeScript client;
+an explicit allowlist can select `[ts_client]` or exclude it. SSE operations
+must not list `ts_client` until a streaming TypeScript contract is defined.
+
+Run the checked-in Iris consumer fixture with:
+
+```bash
+cd examples/ts-client
+npm install
+npm run generate
+npm run check:generated
+npm run typecheck
+```
 
 ### CLI-only boolean presentation flags
 
@@ -211,13 +337,11 @@ are omitted rather than serialized as `null` when `None`.
 V1 is intentionally closed: error names and field names are Rust-safe
 `snake_case`; field names are the exact flat JSON keys; `type: string` is the
 only supported field type; statuses must be 400 through 599; and `const` is a
-string allowed only on required fields. A supplied `const` must be a string
-scalar: the loader rejects null (including an unquoted empty value), booleans,
-numbers, lists, and mappings — each rejection names the definition file, the
-operation, the response, the field, and the `const` key — while quoted scalars
-(including a quoted empty string) are valid declaration data and an omitted
-`const` key keeps the field dynamic. Hydra rejects unknown keys, duplicate
-names, invalid statuses, generated-symbol collisions, and declarations on
+non-empty string allowed only on required fields. Explicitly non-string values
+(`null`, numbers, booleans, sequences, maps) and empty strings are rejected at
+load time with the offending field path; omitting the `const` key leaves the
+field dynamic. Hydra rejects unknown keys, duplicate names, invalid statuses,
+generated-symbol collisions, and declarations on
 operations without HTTP generation before code generation. The declaration
 does not alter request inputs, CLI arguments, MCP schemas, unary route
 dispatch, or the existing SSE binding hook.
@@ -272,6 +396,61 @@ values, and collapses repeated headers to the last value. Definitions
 without raw operations generate byte-identical output to before the flag
 existed.
 
+## Raw-response (finite binary output) operations
+
+Operations that return one finite byte body can opt in with
+`raw_response: true`. Unlike `raw_request`, this preserves the ordinary
+explicit path/query/JSON-body input extraction and changes only the success
+response representation:
+
+```yaml
+- name: fetch_blob
+  description: Return the exact stored blob bytes.
+  method: GET
+  path: /blobs/{blob_id}
+  read: true
+  output_type: Vec<u8>
+  surfaces: [http]
+  raw_response: true
+  raw_response_content_type: application/octet-stream
+  parameters:
+    - name: blob_id
+      description: Blob identifier.
+      type: string
+      required: true
+      location: path
+```
+
+The generated handler passes the operation name and existing
+`GeneratedOperationInput` to the consumer's configured
+`http_raw_response_dispatch_fn`, which asynchronously returns `Vec<u8>`.
+The generated handler type-annotates its dispatch binding as `Vec<u8>`, so a
+dispatcher returning any other type (for example `axum::body::Body`) fails to
+compile. Hydra emits those bytes unchanged as one finite response with fixed
+HTTP 200
+and the declared `Content-Type`; it does not UTF-8 decode, JSON-serialize,
+base64-wrap, stream, or select dynamic status/headers. The consumer adapter
+delegates to the same common operation implementation used by other surfaces.
+Path, query, and JSON-body parameters retain their declared extraction rules.
+
+The Content-Type must be one explicit ASCII MIME `type/subtype` with nonempty
+HTTP-token components. Whitespace, control characters, parameters, and
+wildcards are rejected; Hydra never infers the value from a path, operation
+name, or `output_type`. V1 requires exactly `surfaces: [http]`, unary delivery,
+`raw_request: false`, and no CLI-specific options or typed
+`http_error_responses`. Raw request plus raw response, SSE, and CLI/MCP/
+TypeScript projection are rejected rather than degraded. Existing ordinary
+operations and raw-request behavior remain unchanged.
+
+**Rust API compatibility:** adding `raw_response` and
+`raw_response_content_type` is source-breaking for Rust callers constructing
+`Operation` with a struct literal; add `raw_response: false` and
+`raw_response_content_type: None` when opting out. Existing YAML definitions
+remain compatible because both fields have serde defaults. Adding
+`http_raw_response_dispatch_fn` is source-breaking for exhaustive Rust
+`GenerateConfig` literals; existing `hydra.yaml` files remain compatible via
+the serde default `super::execute_generated_raw_response`.
+
 ## Design rules
 
 - **No inference.** Method, path, parameter locations, and surface
@@ -289,20 +468,75 @@ existed.
 
 ## Releases & versioning
 
-**Status: [v0.2.2](https://github.com/TechGodHQ/hydra/releases/tag/v0.2.2) is
-published.** Its annotated tag resolves to
-`afd8303da577898db06212d87e0fd1d4a32a4d3b`; its workspace manifests are aligned
-with `0.2.2`. Hydra is **not** published to crates.io.
+**Status: [v0.3.0](https://github.com/TechGodHQ/hydra/releases/tag/v0.3.0) is
+published.** Its signed annotated tag object is `a663045a704ca500d3f2b0ea471906dd42ae8674`
+and peels to the exact release target
+`4b518b76ea9f731d75ae3e53f536f669dd493791`; all five workspace manifests are
+aligned with `0.3.0`. The public release is non-draft and non-prerelease.
+Hydra is **not** published to crates.io or npm.
+
+### v0.3.0 release contents
+
+The `v0.3.0` release carries the source-breaking Rust API additions and the
+fourth, TypeScript client projection. Its exact merged inputs are:
+
+- #10 / COD-486 — `9e0b6039c8ea0a1dd1cb7528ef5676c9be40a03a`, explicit CLI-only
+  boolean presentation flags.
+- #11 / COD-490 — `503c7f75cf9ff28e8ae2119f5b1d4f5582be15f4`, release-status
+  documentation.
+- #12 / COD-487 — `40984272cf3a9f77094383dae5f94f4432c3a273`, declared typed HTTP
+  errors.
+- #13 / COD-507 — `abb1c640bba4b8fbd654821c03f028d6d8a243f7`, rendered-help
+  evidence.
+- #14 / COD-508 — `b36ac5f3e998d9f87c81348702c0946db93f309b`, malformed HTTP-error
+  constant validation.
+- #15 / COD-510 — `a7ce4bd620907ae06b599a5cbea50685cd78959b`, the OpenSpec-only
+  stateless MCP Streamable HTTP contract. It does **not** provide or advertise
+  an MCP-over-HTTP runtime.
+- #16 / COD-515 — `b210ff55147dbf5667b2c098c833a94a96126fba`, the TypeScript
+  client projection.
+- #17 / COD-521 — `a15cf8f90e94322d897b888bf34f0a3c25f338b9`, nested TypeScript
+  JSON Schema grouping correction.
+- #18 / COD-522 — `9ba68851c71d5e761a09389ea160419a6a5f68cb`, TypeScript fixture
+  freshness and byte-identical regeneration coverage.
+
+PR #19 / COD-523 supplied the `0.3.0` preparation metadata and compatibility
+notes at the published target. Publication is complete, but this release does
+not itself authorize a consumer to repin, regenerate, deploy, or publish a
+downstream package; those actions remain separately owned and authorized.
+
+Migration notes for an authorized consumer repin:
+
+- Rust callers constructing `Operation` with struct literals must add
+  `cli_output_flags: vec![]` and `http_error_responses: vec![]`; exhaustive
+  matches on `Surface` must handle `Surface::TsClient`.
+- Rust callers constructing `GenerateConfig` with a struct literal must add
+  `ts_client_name` (or use `GenerateConfig::default()`), and callers
+  constructing or destructuring `GeneratedArtifacts` must handle its
+  `ts_client_ts` fourth artifact.
+- Regenerate and commit all four generated artifacts after pinning the exact
+  published tag. The TypeScript projection maps `i64`-sized values to
+  JavaScript `number` with an IEEE-754 precision boundary, and named results
+  remain opaque `Record<string, unknown>` aliases in this release line.
+- The immutable published tag can be used in a consumer git dependency after
+  that consumer's own authorization and regeneration gates are satisfied:
+
+  ```toml
+  hydra-core = { git = "https://github.com/TechGodHQ/hydra", tag = "v0.3.0" }
+  hydra-codegen = { git = "https://github.com/TechGodHQ/hydra", tag = "v0.3.0" }
+  ```
 
 - **Historical tags are immutable.** Tags `v0.1.0` … `v0.2.1` were cut from
   commits whose workspace manifests still said `0.1.0`; they are reproducible
   git pins and will never be moved or rewritten. From v0.2.2 onward the
-  manifest version will agree with the tag at the moment of tagging.
-- **What v0.2.2 covers:** merged PRs [#6](https://github.com/TechGodHQ/hydra/pull/6)
+  manifest version agrees with the tag at the moment of tagging.
+- **What v0.2.2 covered:** merged PRs [#6](https://github.com/TechGodHQ/hydra/pull/6)
   (DeepSec tracer example), [#7](https://github.com/TechGodHQ/hydra/pull/7)
   (layered agent context), and [#8](https://github.com/TechGodHQ/hydra/pull/8)
   (unary cursor pagination fixture) — release metadata, reference coverage,
   and documentation/context changes. No production changes under `crates/*/src`.
+  Its annotated tag resolves to
+  `afd8303da577898db06212d87e0fd1d4a32a4d3b`.
 - **Consumers pin git tags, not crates.io.** Consumers may pin the published
   `v0.2.2` tag and regenerate:
   `hydra-core = { git = "https://github.com/TechGodHQ/hydra", tag = "v0.2.2" }`

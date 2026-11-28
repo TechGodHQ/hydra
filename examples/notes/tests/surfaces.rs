@@ -26,24 +26,22 @@ async fn body_json(res: axum::response::Response) -> Value {
 /// dispatch with a `GeneratedOperationInput`.
 async fn via_dispatch(state: &AppState, op: &str, path_query_body: Value) -> Value {
     let obj = path_query_body.as_object().cloned().unwrap_or_default();
-    let path = obj
-        .get("path")
-        .and_then(|v| v.as_object())
-        .map(|m| {
+    let path = obj.get("path").and_then(|v| v.as_object()).map_or_else(
+        std::collections::BTreeMap::new,
+        |m| {
             m.iter()
                 .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
                 .collect()
-        })
-        .unwrap_or_default();
-    let query = obj
-        .get("query")
-        .and_then(|v| v.as_object())
-        .map(|m| {
+        },
+    );
+    let query = obj.get("query").and_then(|v| v.as_object()).map_or_else(
+        std::collections::BTreeMap::new,
+        |m| {
             m.iter()
                 .map(|(k, v)| (k.clone(), v.to_string().trim_matches('"').to_string()))
                 .collect()
-        })
-        .unwrap_or_default();
+        },
+    );
     let body = obj.get("body").cloned().unwrap_or(Value::Null);
     execute_operation(state, op, GeneratedOperationInput { path, query, body })
         .await

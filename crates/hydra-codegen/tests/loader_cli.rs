@@ -57,17 +57,24 @@ fn cli_check_rejects_malformed_const_with_named_diagnostic() {
     let (success, stderr) = run_check(&dir);
     assert!(!success, "a malformed const must fail the CLI check");
     assert!(
+        stderr.contains("api/operations.yaml"),
+        "the CLI rejection must name the definition file: {stderr}"
+    );
+    assert!(
+        stderr.contains("operation read_events HTTP error response rate_limited field error"),
+        "the CLI rejection must name the declaration: {stderr}"
+    );
+    assert!(
         stderr.contains(
-            "api/operations.yaml: operation read_events HTTP error response \
-rate_limited field error declares `const` with a number value (42)"
+            "declares const with a non-string value; const must be a string when supplied"
         ),
-        "the CLI rejection must name the definition path and the field's const key: {stderr}"
+        "the CLI rejection must explain the current validation rule: {stderr}"
     );
 }
 
 #[test]
-fn cli_check_accepts_quoted_constants_including_empty() {
-    for declaration in ["\"rate limited\"", "\"\""] {
+fn cli_check_accepts_nonempty_quoted_constants() {
+    for declaration in ["\"rate limited\"", "\"42\"", "\"true\""] {
         let dir = write_project(declaration);
         let (success, stderr) = run_check(&dir);
         // The definition must load; the project fails later only because no
@@ -78,8 +85,27 @@ fn cli_check_accepts_quoted_constants_including_empty() {
              artifact comparison: {stderr}"
         );
         assert!(
-            !stderr.contains("`const` must be a string"),
-            "a quoted string constant must never be rejected: {stderr}"
+            !stderr.contains("const as an empty string"),
+            "a nonempty quoted string must not be rejected as empty: {stderr}"
         );
     }
+}
+
+#[test]
+fn cli_check_rejects_quoted_empty_constant_with_named_diagnostic() {
+    let dir = write_project("\"\"");
+    let (success, stderr) = run_check(&dir);
+    assert!(!success, "the current contract rejects an empty const");
+    assert!(
+        stderr.contains("api/operations.yaml"),
+        "the CLI diagnostic must identify the definition file: {stderr}"
+    );
+    assert!(
+        stderr.contains("operation read_events HTTP error response rate_limited field error"),
+        "the CLI diagnostic must identify the declaration: {stderr}"
+    );
+    assert!(
+        stderr.contains("declares const as an empty string"),
+        "the CLI diagnostic must explain the current non-empty rule: {stderr}"
+    );
 }

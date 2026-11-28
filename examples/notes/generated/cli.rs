@@ -108,4 +108,3 @@ pub struct IngestBatchArgs {
     #[arg(long = "event", action = clap::ArgAction::Append, required = true)]
     pub events: Option<Vec<String>>,
 }
-
