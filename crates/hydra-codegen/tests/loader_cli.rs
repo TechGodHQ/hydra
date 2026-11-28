@@ -38,13 +38,13 @@ fn write_project(constant_declaration: &str) -> tempfile::TempDir {
     dir
 }
 
-/// Run `hydra-codegen check` inside `dir`, returning stderr and success.
-fn run_check(dir: &tempfile::TempDir) -> (bool, String) {
+/// Run a `hydra-codegen` command inside `dir`, returning success and stderr.
+fn run_codegen(dir: &tempfile::TempDir, command: &str) -> (bool, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_hydra-codegen"))
-        .arg("check")
+        .arg(command)
         .current_dir(dir.path())
         .output()
-        .expect("run hydra-codegen check");
+        .unwrap_or_else(|err| panic!("run hydra-codegen {command}: {err}"));
     (
         output.status.success(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -54,7 +54,7 @@ fn run_check(dir: &tempfile::TempDir) -> (bool, String) {
 #[test]
 fn cli_check_rejects_malformed_const_with_named_diagnostic() {
     let dir = write_project("42");
-    let (success, stderr) = run_check(&dir);
+    let (success, stderr) = run_codegen(&dir, "check");
     assert!(!success, "a malformed const must fail the CLI check");
     assert!(
         stderr.contains("api/operations.yaml"),
@@ -73,28 +73,23 @@ fn cli_check_rejects_malformed_const_with_named_diagnostic() {
 }
 
 #[test]
-fn cli_check_accepts_nonempty_quoted_constants() {
+fn cli_write_and_check_accept_nonempty_quoted_constants() {
     for declaration in ["\"rate limited\"", "\"42\"", "\"true\""] {
         let dir = write_project(declaration);
-        let (success, stderr) = run_check(&dir);
-        // The definition must load; the project fails later only because no
-        // generated artifacts exist yet, which proves the const was accepted.
-        assert!(
-            !success && stderr.contains("generated artifacts are stale"),
-            "{declaration:?} must load through the CLI boundary and reach the \
-             artifact comparison: {stderr}"
-        );
-        assert!(
-            !stderr.contains("const as an empty string"),
-            "a nonempty quoted string must not be rejected as empty: {stderr}"
-        );
+        for command in ["write", "check"] {
+            let (success, stderr) = run_codegen(&dir, command);
+            assert!(
+                success,
+                "hydra-codegen {command} failed with {declaration:?}: {stderr}"
+            );
+        }
     }
 }
 
 #[test]
 fn cli_check_rejects_quoted_empty_constant_with_named_diagnostic() {
     let dir = write_project("\"\"");
-    let (success, stderr) = run_check(&dir);
+    let (success, stderr) = run_codegen(&dir, "check");
     assert!(!success, "the current contract rejects an empty const");
     assert!(
         stderr.contains("api/operations.yaml"),
