@@ -33,4 +33,3 @@ pub struct RunSecurityScanArgs {
     #[arg(long)]
     pub profile: Option<String>,
 }
-

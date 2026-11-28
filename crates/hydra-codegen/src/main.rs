@@ -2,7 +2,9 @@
 //! verifies they are current. Meant to run locally and in CI.
 
 use anyhow::{Context, Result};
-use hydra_codegen::{GenerateConfig, generate_all, verify_generated, write_generated};
+use hydra_codegen::{
+    GenerateConfig, generate_all, validate_generation, verify_generated, write_generated,
+};
 use hydra_core::{DEFAULT_DEFINITION_PATH, DEFAULT_GENERATED_DIR};
 
 fn main() -> Result<()> {
@@ -13,9 +15,11 @@ fn main() -> Result<()> {
     match command.as_str() {
         "write" => {
             let definition = hydra_core::load_api_definition(DEFAULT_DEFINITION_PATH)?;
+            validate_generation(&definition, &config)
+                .context("validate generated TypeScript identifiers")?;
             let artifacts = generate_all(&definition, &config);
             write_generated(DEFAULT_GENERATED_DIR, &artifacts)?;
-            println!("wrote {DEFAULT_GENERATED_DIR}/cli.rs, http.rs, mcp.json");
+            println!("wrote {DEFAULT_GENERATED_DIR}/cli.rs, http.rs, mcp.json, ts-client/index.ts");
         }
         "check" => {
             verify_generated(DEFAULT_DEFINITION_PATH, DEFAULT_GENERATED_DIR, &config)
@@ -34,5 +38,7 @@ fn load_config() -> Result<GenerateConfig> {
         return Ok(GenerateConfig::default());
     }
     let raw = std::fs::read_to_string(path).context("read hydra.yaml")?;
-    serde_yaml::from_str(&raw).context("parse hydra.yaml")
+    let config: GenerateConfig = serde_yaml::from_str(&raw).context("parse hydra.yaml")?;
+    config.validate().context("validate hydra.yaml")?;
+    Ok(config)
 }

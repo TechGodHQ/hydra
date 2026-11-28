@@ -61,6 +61,26 @@ pub fn generated_router() -> Router<crate::AppState> {
         .route("/ingest/batches", post(ingest_batch))
 }
 
+/// Streaming (SSE) operations declared in the API definition. The
+/// generated surface exposes only this metadata plus the binding hooks
+/// below; the handwritten server supplies the handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeneratedSseRoute {
+    pub name: &'static str,
+    pub method: &'static str,
+    pub path: &'static str,
+}
+
+pub const GENERATED_SSE_ROUTES: &[GeneratedSseRoute] = &[
+    GeneratedSseRoute { name: "subscribe_events", method: "GET", path: "/events/stream" },
+];
+
+/// Runtime binding hook for the `subscribe_events` SSE operation. The handwritten server implements this
+/// binding; generated code does not generate a duplicate route.
+pub fn bind_subscribe_events(router: Router<crate::AppState>) -> Router<crate::AppState> {
+    super::bind_runtime_sse_subscribe_events(router)
+}
+
 async fn list_notes(
     State(state): State<crate::AppState>,
     Query(query): Query<BTreeMap<String, String>>,

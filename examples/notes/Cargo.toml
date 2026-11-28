@@ -11,6 +11,7 @@ publish = false
 workspace = true
 
 [dependencies]
+hydra-mcp-http = { workspace = true }
 hydra-mcp-stdio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -18,6 +19,7 @@ anyhow = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 axum = { workspace = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

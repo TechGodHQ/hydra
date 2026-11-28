@@ -6,3 +6,4 @@ http_state_type: "crate::AppState"
 # Raw-request operations (raw_request: true) dispatch here instead.
 http_raw_dispatch_fn: "crate::execute_operation_raw_http"
 sse_binding_prefix: "super::"
+ts_client_name: "NotesClient"

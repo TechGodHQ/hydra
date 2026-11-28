@@ -60,25 +60,24 @@ fn required_field_with_const(const_line: &str) -> String {
 }
 
 #[test]
-fn load_rejects_non_string_and_unquoted_empty_const_values() {
+fn load_rejects_non_string_const_values() {
     let cases = [
-        ("const:", "null"),
-        ("const: true", "boolean"),
-        ("const: 30", "number"),
-        ("const: [boom]", "sequence"),
-        ("const: {code: boom}", "mapping"),
+        "const:",
+        "const: true",
+        "const: 30",
+        "const: [boom]",
+        "const: {code: boom}",
     ];
-    for (const_line, expected_kind) in cases {
+    for const_line in cases {
         let path = definition_file(&definition_with_fields(&required_field_with_const(
             const_line,
         )));
         let outcome = hydra_core::load_api_definition(&path);
         discard(&path);
-        let message = outcome
-            .expect_err(&format!(
-                "const {const_line:?} must be rejected at load time"
-            ))
-            .to_string();
+        let error = outcome.expect_err(&format!(
+            "const {const_line:?} must be rejected at load time"
+        ));
+        let message = format!("{error:#}");
         let path_text = path.display().to_string();
         assert!(message.contains(&path_text), "path missing: {message}");
         assert!(message.contains("operation read_events"), "{message}");
@@ -87,13 +86,56 @@ fn load_rejects_non_string_and_unquoted_empty_const_values() {
             "{message}"
         );
         assert!(message.contains("field error"), "{message}");
-        assert!(message.contains("declares const with"), "{message}");
-        assert!(message.contains(expected_kind), "{message}");
         assert!(
-            message.contains("const must be a string scalar"),
+            message.contains("declares const with a non-string value"),
+            "{message}"
+        );
+        assert!(
+            message.contains("const must be a string when supplied"),
             "{message}"
         );
     }
+}
+
+#[test]
+fn load_rejects_quoted_empty_const_values() {
+    let const_line = format!("const: {}{}", '"', '"');
+    let path = definition_file(&definition_with_fields(&required_field_with_const(
+        &const_line,
+    )));
+    let outcome = hydra_core::load_api_definition(&path);
+    discard(&path);
+    let error = outcome.expect_err("an empty string constant must be rejected at load time");
+    let message = format!("{error:#}");
+    let path_text = path.display().to_string();
+    assert!(message.contains(&path_text), "path missing: {message}");
+    assert!(message.contains("operation read_events"), "{message}");
+    assert!(
+        message.contains("HTTP error response rate_limited"),
+        "{message}"
+    );
+    assert!(message.contains("field error"), "{message}");
+    assert!(
+        message.contains("declares const as an empty string"),
+        "{message}"
+    );
+    assert!(
+        message.contains("omit the key to leave the field dynamic"),
+        "{message}"
+    );
+}
+
+#[test]
+fn direct_typed_deserialization_rejects_non_string_const_values() {
+    let yaml = definition_with_fields(&required_field_with_const("const: true"));
+    let error = serde_yaml::from_str::<hydra_core::ApiDefinition>(&yaml)
+        .expect_err("direct typed deserialization must preserve strict const parsing");
+    assert!(
+        error
+            .to_string()
+            .contains("HTTP error field const must be a string when supplied"),
+        "unexpected deserializer diagnostic: {error}"
+    );
 }
 
 #[test]
@@ -103,9 +145,8 @@ fn load_rejects_const_on_optional_fields() {
     ));
     let outcome = hydra_core::load_api_definition(&path);
     discard(&path);
-    let message = outcome
-        .expect_err("const on an optional field must be rejected")
-        .to_string();
+    let error = outcome.expect_err("const on an optional field must be rejected");
+    let message = format!("{error:#}");
     let path_text = path.display().to_string();
     assert!(message.contains(&path_text), "path missing: {message}");
     assert!(message.contains("operation read_events"), "{message}");
@@ -121,12 +162,11 @@ fn load_rejects_const_on_optional_fields() {
 }
 
 #[test]
-fn load_accepts_quoted_scalars_including_quoted_empty_string() {
+fn load_accepts_nonempty_quoted_scalars() {
     let cases = [
-        ("const: \"\"", ""),
-        ("const: \"true\"", "true"),
-        ("const: \"30\"", "30"),
-        ("const: \"backoff\"", "backoff"),
+        (r#"const: "true""#, "true"),
+        (r#"const: "30""#, "30"),
+        (r#"const: "backoff""#, "backoff"),
     ];
     for (const_line, expected) in cases {
         let path = definition_file(&definition_with_fields(&required_field_with_const(

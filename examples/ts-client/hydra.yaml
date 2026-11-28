@@ -1,0 +1,5 @@
+# TypeScript-only example configuration. The API definition is the Iris
+# consumer fixture; the generated client does not need Rust dispatch settings.
+http_dispatch_fn: "crate::unused_dispatch"
+http_state_type: "crate::UnusedState"
+ts_client_name: "IrisClient"

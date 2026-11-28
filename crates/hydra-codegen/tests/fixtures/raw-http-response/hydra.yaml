@@ -1,0 +1,3 @@
+http_dispatch_fn: super::execute_generated_operation
+http_state_type: crate::RawResponseFixtureState
+http_raw_response_dispatch_fn: crate::raw_response_dispatch

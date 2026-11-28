@@ -6,9 +6,20 @@
 //! same `execute_operation` dispatch. Regenerate with
 //! `cargo run -p hydra-codegen -- write` from the workspace root.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    convert::Infallible,
+    sync::{Arc, Mutex},
+};
 
-use axum::{Router, http::StatusCode, response::IntoResponse};
+use axum::{
+    Router,
+    http::StatusCode,
+    response::{
+        IntoResponse,
+        sse::{Event, Sse},
+    },
+    routing::get,
+};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -392,9 +403,29 @@ pub async fn execute_operation_raw_http(
 
 // ── Surface wiring ────────────────────────────────────────────────────────
 
+/// Bind the consumer-owned handler for Hydra's generated `subscribe_events`
+/// SSE hook. The finite fixture stream is synthetic and does not use the
+/// shared unary operation dispatcher.
+pub fn bind_runtime_sse_subscribe_events(router: Router<AppState>) -> Router<AppState> {
+    router.route("/events/stream", get(runtime_sse_subscribe_events))
+}
+
+async fn runtime_sse_subscribe_events()
+-> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    let events = [
+        Ok(Event::default()
+            .event("note.created")
+            .data(r#"{"id":"n1"}"#)),
+        Ok(Event::default()
+            .event("note.updated")
+            .data(r#"{"id":"n1","title":"fixture"}"#)),
+    ];
+    Sse::new(futures_util::stream::iter(events))
+}
+
 /// Build the full HTTP router for the notes service.
 pub fn http_router(state: AppState) -> Router {
-    generated::generated_router().with_state(state)
+    generated::bind_subscribe_events(generated::generated_router()).with_state(state)
 }
 
 /// HTTP entry: `notes-http` serves on 127.0.0.1:8941.
@@ -429,22 +460,20 @@ pub async fn run_cli() -> anyhow::Result<()> {
     let input = generated::GeneratedOperationInput {
         path: params
             .as_object()
-            .map(|o| {
+            .map_or_else(std::collections::BTreeMap::new, |o| {
                 o.iter()
                     .filter(|(_, v)| v.is_string())
                     .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
                     .collect()
-            })
-            .unwrap_or_default(),
+            }),
         query: params
             .as_object()
-            .map(|o| {
+            .map_or_else(std::collections::BTreeMap::new, |o| {
                 o.iter()
                     .filter(|(_, v)| v.is_number() || v.is_boolean())
                     .map(|(k, v)| (k.clone(), v.to_string()))
                     .collect()
-            })
-            .unwrap_or_default(),
+            }),
         body: params.clone(),
     };
 
@@ -460,17 +489,88 @@ pub async fn run_cli() -> anyhow::Result<()> {
     }
 }
 
+/// Extract the generated parameter-location table used by both MCP
+/// transports. The table is emitted by Hydra; no parameter-name inference is
+/// performed here.
+#[must_use]
+pub fn mcp_locations(tools: &Value) -> Value {
+    tools
+        .get("locations")
+        .and_then(|locations| locations.get("tools"))
+        .cloned()
+        .unwrap_or_else(|| tools.get("locations").cloned().unwrap_or(Value::Null))
+}
+
+/// Adapt a generated MCP tool call to the one Notes operation dispatcher.
+///
+/// This function is deliberately shared by stdio and the HTTP transport so a
+/// transport cannot grow a second parameter-routing implementation.
+pub async fn dispatch_mcp_tool(
+    state: &AppState,
+    locations: &Value,
+    name: String,
+    args: Value,
+) -> Result<Value, String> {
+    let Some(args) = args.as_object() else {
+        return Err("tool arguments must be an object".to_owned());
+    };
+    let mut path = std::collections::BTreeMap::new();
+    let mut query = std::collections::BTreeMap::new();
+    let mut body = Value::Null;
+    let op_locations = locations
+        .as_object()
+        .and_then(|object| object.get(&name))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut body_map = serde_json::Map::new();
+    for (key, location) in &op_locations {
+        let value = args.get(key).cloned().unwrap_or(Value::Null);
+        match location.as_str().unwrap_or("body") {
+            "path" => {
+                path.insert(key.clone(), value.as_str().unwrap_or_default().to_owned());
+            }
+            "query" => {
+                query.insert(key.clone(), value.to_string().trim_matches('"').to_owned());
+            }
+            _ => {
+                body_map.insert(key.clone(), value);
+            }
+        }
+    }
+    if !body_map.is_empty() {
+        body = Value::Object(body_map);
+    }
+    let input = generated::GeneratedOperationInput { path, query, body };
+    execute_operation(state, &name, input)
+        .await
+        .map_err(|error| error.message)
+}
+
+/// Build the Notes MCP-over-HTTP router without binding a listener.
+pub fn mcp_http_router(state: AppState) -> anyhow::Result<Router> {
+    let tools: Value = serde_json::from_str(GENERATED_MCP_JSON)?;
+    let locations = mcp_locations(&tools);
+    let config = hydra_mcp_http::ServerConfig::new(
+        "notes",
+        env!("CARGO_PKG_VERSION"),
+        tools,
+        hydra_mcp_http::OriginPolicy::RejectPresented,
+    );
+    let runtime = hydra_mcp_http::router(config, move |name, args| {
+        let state = state.clone();
+        let locations = locations.clone();
+        async move { dispatch_mcp_tool(&state, &locations, name, args).await }
+    })
+    .map_err(|error| anyhow::anyhow!("mcp HTTP configuration error: {error}"))?;
+    Ok(Router::new().nest("/mcp", runtime))
+}
+
 /// MCP entry: serve tools from generated mcp.json over stdio.
 pub async fn run_mcp() -> anyhow::Result<()> {
     let tools: Value = serde_json::from_str(GENERATED_MCP_JSON)?;
     let state = AppState::with_fixtures();
-    // Route tool arguments into path/query/body using the location metadata
-    // emitted alongside the tool schemas — no name inference.
-    let locations = tools
-        .get("locations")
-        .and_then(|l| l.get("tools"))
-        .cloned()
-        .unwrap_or_else(|| tools.get("locations").cloned().unwrap_or(Value::Null));
+    let locations = mcp_locations(&tools);
 
     hydra_mcp_stdio::serve(
         "notes",
@@ -479,49 +579,20 @@ pub async fn run_mcp() -> anyhow::Result<()> {
         move |name, args| {
             let state = state.clone();
             let locations = locations.clone();
-            async move {
-                let mut path = std::collections::BTreeMap::new();
-                let mut query = std::collections::BTreeMap::new();
-                let mut body = Value::Null;
-                let op_locations = locations
-                    .as_object()
-                    .and_then(|o| o.get(&name))
-                    .and_then(|v| v.as_object())
-                    .cloned()
-                    .unwrap_or_default();
-                let mut body_map = serde_json::Map::new();
-                for (key, location) in &op_locations {
-                    let value = args.get(key).cloned().unwrap_or(Value::Null);
-                    match location.as_str().unwrap_or("body") {
-                        "path" => {
-                            path.insert(
-                                key.clone(),
-                                value.as_str().unwrap_or_default().to_string(),
-                            );
-                        }
-                        "query" => {
-                            query.insert(
-                                key.clone(),
-                                value.to_string().trim_matches('"').to_string(),
-                            );
-                        }
-                        _ => {
-                            body_map.insert(key.clone(), value);
-                        }
-                    }
-                }
-                if !body_map.is_empty() {
-                    body = Value::Object(body_map);
-                }
-                let input = generated::GeneratedOperationInput { path, query, body };
-                match execute_operation(&state, &name, input).await {
-                    Ok(value) => Ok(value),
-                    Err(err) => Err(err.message),
-                }
-            }
+            async move { dispatch_mcp_tool(&state, &locations, name, args).await }
         },
     )
     .await
-    .map_err(|e| anyhow::anyhow!("mcp stdio error: {e}"))?;
+    .map_err(|error| anyhow::anyhow!("mcp stdio error: {error}"))?;
+    Ok(())
+}
+
+/// MCP-over-HTTP entry: bind the reference consumer to loopback and mount the
+/// reusable runtime at the explicit `/mcp` path.
+pub async fn run_mcp_http() -> anyhow::Result<()> {
+    let app = mcp_http_router(AppState::with_fixtures())?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8942").await?;
+    println!("listening on http://127.0.0.1:8942/mcp");
+    axum::serve(listener, app).await?;
     Ok(())
 }

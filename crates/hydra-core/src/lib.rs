@@ -2,8 +2,9 @@
 //! generated surfaces.
 //!
 //! An [`ApiDefinition`] is the single source of truth for a project's
-//! operations. Hydra projects it onto three surfaces — CLI (clap), HTTP
-//! (axum), and MCP (tool schemas + stdio runtime) — without name-based
+//! operations. Hydra projects it onto four surfaces — CLI (clap), HTTP
+//! (axum), MCP (tool schemas + stdio runtime), and a fetch-based TypeScript
+//! client — without name-based
 //! inference: every route, parameter location, and surface allowlist is
 //! declared explicitly, so the generated contract cannot drift from the
 //! generated router.
@@ -14,7 +15,7 @@
 use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as DeError};
 
 pub mod paths;
 pub mod validate;
@@ -115,6 +116,18 @@ pub struct Operation {
     /// values, and collapses repeated headers to the last value.
     #[serde(default)]
     pub raw_request: bool,
+    /// Opt in to a finite raw-byte response on the HTTP surface. The generated
+    /// handler still extracts declared path/query/JSON-body inputs, then calls
+    /// the consumer-owned byte dispatcher and returns its bytes without JSON
+    /// serialization. Raw responses require exactly `[http]`, unary delivery,
+    /// and an explicit `raw_response_content_type` declaration.
+    #[serde(default)]
+    pub raw_response: bool,
+    /// Explicit literal `type/subtype` Content-Type for a `raw_response`
+    /// operation. Parameters and wildcards are not supported. A value without
+    /// `raw_response: true` is invalid.
+    #[serde(default)]
+    pub raw_response_content_type: Option<String>,
 }
 
 /// Response delivery kind for a generated operation.
@@ -130,7 +143,7 @@ pub enum Delivery {
 
 /// A generated surface an operation may be exposed on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Surface {
     /// The HTTP REST surface.
     Http,
@@ -138,6 +151,8 @@ pub enum Surface {
     Cli,
     /// The MCP tool surface.
     Mcp,
+    /// The fetch-based TypeScript client surface.
+    TsClient,
 }
 
 impl Operation {
@@ -152,6 +167,12 @@ impl Operation {
     #[must_use]
     pub const fn is_raw_request(&self) -> bool {
         self.raw_request
+    }
+
+    /// Whether this operation returns a finite, exact byte response over HTTP.
+    #[must_use]
+    pub const fn is_raw_response(&self) -> bool {
+        self.raw_response
     }
 
     /// Whether the HTTP surface is generated for this operation.
@@ -176,6 +197,17 @@ impl Operation {
         self.surfaces
             .as_ref()
             .is_none_or(|surfaces| surfaces.contains(&Surface::Mcp))
+    }
+
+    /// Whether the TypeScript client surface is generated for this operation.
+    /// Unary operations with no explicit allowlist opt in by default; SSE
+    /// operations stay out until a streaming TypeScript contract exists.
+    #[must_use]
+    pub fn generates_ts_client(&self) -> bool {
+        self.surfaces.as_ref().map_or_else(
+            || !self.is_sse(),
+            |surfaces| surfaces.contains(&Surface::TsClient),
+        )
     }
 }
 
@@ -309,8 +341,32 @@ pub struct HttpErrorField {
     ///
     /// Constants are permitted only for required fields, so optional fields
     /// retain their `Option<String>` omission semantics.
-    #[serde(rename = "const", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "const",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_http_error_constant"
+    )]
     pub constant: Option<String>,
+}
+
+/// Deserialize a declared HTTP-error constant without collapsing an explicit
+/// YAML null into an omitted declaration.
+///
+/// `default` supplies `None` only when the `const` key is absent. A supplied
+/// key must deserialize as a string, so YAML null and every non-string node
+/// fail at the definition-loader boundary rather than becoming a dynamic
+/// generated constructor argument.
+fn deserialize_http_error_constant<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match serde_yaml::Value::deserialize(deserializer)? {
+        serde_yaml::Value::String(value) => Ok(Some(value)),
+        _ => Err(D::Error::custom(
+            "HTTP error field const must be a string when supplied",
+        )),
+    }
 }
 
 /// Field types supported by typed HTTP error responses.
@@ -386,21 +442,102 @@ pub enum ParameterLocation {
 }
 
 /// Load an API definition from YAML.
-///
-/// HTTP-error `const` declarations are gated against the raw YAML form before
-/// typed parsing: an omitted key and an unquoted empty value both deserialize
-/// to `Option::None`, and unquoted booleans and numbers coerce into strings,
-/// so only the raw form can reject those declarations while naming the
-/// definition file path and the offending field's `const` key.
 pub fn load_api_definition(path: impl AsRef<Path>) -> Result<ApiDefinition> {
     let path = path.as_ref();
     let raw = fs::read_to_string(path)
         .with_context(|| format!("read API definition from {}", path.display()))?;
-    let raw_value: serde_yaml::Value = serde_yaml::from_str(&raw)
+    let raw_definition: serde_yaml::Value = serde_yaml::from_str(&raw)
         .with_context(|| format!("parse API definition from {}", path.display()))?;
-    validate::validate_http_error_constant_declarations(&raw_value, path)?;
-    let definition: ApiDefinition = serde_yaml::from_value(raw_value)
+    validate_http_error_constant_declarations(&raw_definition)
+        .with_context(|| format!("validate HTTP error constants in {}", path.display()))?;
+    let definition: ApiDefinition = serde_yaml::from_str(&raw)
         .with_context(|| format!("parse API definition from {}", path.display()))?;
-    validate::validate_definition(&definition)?;
+    validate::validate_definition(&definition)
+        .with_context(|| format!("validate API definition from {}", path.display()))?;
     Ok(definition)
+}
+
+/// Reject supplied non-string and empty HTTP-error constants with declaration
+/// names.
+///
+/// The public model intentionally keeps `constant` as `Option<String>` for
+/// programmatic construction. Inspecting the raw YAML before typed
+/// deserialization preserves the otherwise-lost distinction between an absent
+/// key and an explicit YAML null while giving users named operation, response,
+/// and field diagnostics. A supplied constant must carry content: an explicit
+/// empty string declares no fixed value, so it is rejected alongside
+/// non-string values rather than silently emitted as an empty constant.
+fn validate_http_error_constant_declarations(definition: &serde_yaml::Value) -> Result<()> {
+    let Some(root) = definition.as_mapping() else {
+        return Ok(());
+    };
+    let Some(operations) =
+        yaml_mapping_value(root, "operations").and_then(serde_yaml::Value::as_sequence)
+    else {
+        return Ok(());
+    };
+
+    for (operation_index, operation) in operations.iter().enumerate() {
+        let Some(operation) = operation.as_mapping() else {
+            continue;
+        };
+        let operation_name = yaml_mapping_value(operation, "name")
+            .and_then(serde_yaml::Value::as_str)
+            .map_or_else(
+                || format!("operations[{operation_index}]"),
+                ToOwned::to_owned,
+            );
+        let Some(responses) = yaml_mapping_value(operation, "http_error_responses")
+            .and_then(serde_yaml::Value::as_sequence)
+        else {
+            continue;
+        };
+
+        for (response_index, response) in responses.iter().enumerate() {
+            let Some(response) = response.as_mapping() else {
+                continue;
+            };
+            let response_name = yaml_mapping_value(response, "name")
+                .and_then(serde_yaml::Value::as_str)
+                .map_or_else(
+                    || format!("http_error_responses[{response_index}]"),
+                    ToOwned::to_owned,
+                );
+            let Some(fields) =
+                yaml_mapping_value(response, "fields").and_then(serde_yaml::Value::as_sequence)
+            else {
+                continue;
+            };
+
+            for (field_index, field) in fields.iter().enumerate() {
+                let Some(field) = field.as_mapping() else {
+                    continue;
+                };
+                let field_name = yaml_mapping_value(field, "name")
+                    .and_then(serde_yaml::Value::as_str)
+                    .map_or_else(|| format!("fields[{field_index}]"), ToOwned::to_owned);
+                if let Some(constant) = yaml_mapping_value(field, "const") {
+                    match constant {
+                        serde_yaml::Value::String(value) if !value.is_empty() => {}
+                        serde_yaml::Value::String(_) => anyhow::bail!(
+                            "operation {operation_name} HTTP error response {response_name} field {field_name} declares const as an empty string; omit the key to leave the field dynamic"
+                        ),
+                        _ => anyhow::bail!(
+                            "operation {operation_name} HTTP error response {response_name} field {field_name} declares const with a non-string value; const must be a string when supplied"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Look up a string key in a YAML mapping without coercing YAML values.
+fn yaml_mapping_value<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    key: &str,
+) -> Option<&'a serde_yaml::Value> {
+    mapping.get(serde_yaml::Value::String(key.to_owned()))
 }

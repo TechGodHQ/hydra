@@ -1,7 +1,7 @@
 //! Ported from iris-codegen's test suite, extended for hydra's config knob
 //! and location metadata.
 
-use std::{collections::BTreeMap, fs};
+use std::{collections::BTreeMap, fs, net::SocketAddr, path::PathBuf, time::Duration};
 
 use axum::{
     Router,
@@ -12,10 +12,125 @@ use axum::{
     routing::get,
 };
 use clap::Parser;
-use hydra_codegen::{GenerateConfig, generate_all, write_generated};
+use hydra_codegen::{GenerateConfig, generate_all, verify_generated, write_generated};
 use hydra_core::{ApiDefinition, Delivery, HttpMethod, Operation, Parameter, ParameterLocation};
 use pretty_assertions::assert_eq;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::oneshot,
+};
 use tower::ServiceExt;
+
+#[allow(dead_code)]
+mod raw_http_response_fixture {
+    include!("fixtures/raw-http-response/generated/http.rs");
+}
+
+#[derive(Clone, Default)]
+struct RawResponseFixtureState;
+
+#[allow(clippy::unused_async)]
+async fn raw_response_dispatch(
+    _state: &RawResponseFixtureState,
+    operation: &str,
+    input: raw_http_response_fixture::GeneratedOperationInput,
+) -> Vec<u8> {
+    assert_eq!(operation, "fetch_bytes");
+    assert_eq!(
+        input.path.get("object_id").map(String::as_str),
+        Some("blob-7")
+    );
+    assert_eq!(input.body["metadata"]["label"], "fixture");
+    match input.query.get("mode").map(String::as_str) {
+        Some("empty") => Vec::new(),
+        Some("binary") => vec![0x00, 0xff, 0x80, 0x0a, 0x0d, 0x7f],
+        other => panic!("unexpected fixture mode: {other:?}"),
+    }
+}
+
+const RAW_RESPONSE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const RAW_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
+
+async fn raw_response_http_request(address: SocketAddr, mode: &str) -> (u16, String, Vec<u8>) {
+    let body = r#"{"metadata":{"label":"fixture"}}"#;
+    let request = format!(
+        "POST /objects/blob-7/bytes?mode={mode} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let response = tokio::time::timeout(RAW_RESPONSE_REQUEST_TIMEOUT, async {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream
+            .take((RAW_RESPONSE_MAX_BYTES + 1) as u64)
+            .read_to_end(&mut response)
+            .await
+            .unwrap();
+        response
+    })
+    .await
+    .expect("raw-response loopback request exceeded its timeout");
+    assert!(
+        response.len() <= RAW_RESPONSE_MAX_BYTES,
+        "raw-response fixture exceeded the response byte bound"
+    );
+    let separator = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("raw-response HTTP response must include a header terminator");
+    let headers = String::from_utf8(response[..separator].to_vec())
+        .expect("raw-response HTTP headers must be UTF-8");
+    let status = headers
+        .lines()
+        .next()
+        .expect("HTTP status line")
+        .split_whitespace()
+        .nth(1)
+        .expect("HTTP status code")
+        .parse()
+        .expect("numeric HTTP status code");
+    let body = response[separator + 4..].to_vec();
+    (status, headers, body)
+}
+
+#[tokio::test]
+async fn raw_response_returns_exact_empty_and_non_utf8_bytes_over_loopback() {
+    let app = raw_http_response_fixture::generated_router().with_state(RawResponseFixtureState);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown, shutdown_signal) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_signal.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    for (mode, expected_body) in [
+        ("empty", Vec::new()),
+        ("binary", vec![0x00, 0xff, 0x80, 0x0a, 0x0d, 0x7f]),
+    ] {
+        let (status, headers, body) = raw_response_http_request(address, mode).await;
+        assert_eq!(status, 200, "raw response status must be fixed at 200");
+        let content_types = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.trim())
+            .collect::<Vec<_>>();
+        assert_eq!(content_types, ["application/octet-stream"]);
+        assert_eq!(body, expected_body, "mode {mode} must preserve exact bytes");
+        println!(
+            "raw-response mode={mode}: HTTP {status}, Content-Type=application/octet-stream, body={body:?}"
+        );
+    }
+
+    shutdown.send(()).unwrap();
+    server.await.unwrap();
+}
 
 #[allow(dead_code)]
 mod http_error_responses_fixture {
@@ -110,11 +225,14 @@ fn context_page_definition() -> ApiDefinition {
                 hydra_core::Surface::Cli,
                 hydra_core::Surface::Http,
                 hydra_core::Surface::Mcp,
+                hydra_core::Surface::TsClient,
             ]),
             cli_command: None,
             cli_output_flags: vec![],
             http_error_responses: vec![],
             raw_request: false,
+            raw_response: false,
+            raw_response_content_type: None,
         }],
     }
 }
@@ -143,12 +261,41 @@ fn sample_definition() -> ApiDefinition {
             cli_output_flags: vec![],
             http_error_responses: vec![],
             raw_request: false,
+            raw_response: false,
+            raw_response_content_type: None,
         }],
     }
 }
 
+fn nested_ts_schema_fixture_definition() -> ApiDefinition {
+    hydra_core::load_api_definition(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/nested-ts-schema/api/operations.yaml"
+    ))
+    .expect("nested TypeScript schema fixture must load")
+}
+
+fn raw_response_fixture_definition() -> ApiDefinition {
+    hydra_core::load_api_definition(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/raw-http-response/api/operations.yaml"
+    ))
+    .expect("raw-response fixture definition must load")
+}
+
+fn raw_response_fixture_config() -> GenerateConfig {
+    serde_yaml::from_str(include_str!("fixtures/raw-http-response/hydra.yaml"))
+        .expect("raw-response fixture config must parse")
+}
+
+fn validate_raw_response_operation(operation: Operation) -> anyhow::Result<()> {
+    hydra_core::validate::validate_definition(&ApiDefinition {
+        operations: vec![operation],
+    })
+}
+
 #[test]
-fn generates_all_three_surfaces_from_definition() {
+fn generates_all_four_surfaces_from_definition() {
     let artifacts = generate_all(&sample_definition(), &GenerateConfig::default());
     assert!(artifacts.cli_rs.contains("ListItems(ListItemsArgs)"));
     assert!(
@@ -157,6 +304,8 @@ fn generates_all_three_surfaces_from_definition() {
             .contains(".route(\"/items\", get(list_items))")
     );
     assert!(artifacts.mcp_json.contains("\"list_items\""));
+    assert!(artifacts.ts_client_ts.contains("export class HydraClient"));
+    assert!(artifacts.ts_client_ts.contains("async listItems"));
 }
 
 #[test]
@@ -191,11 +340,14 @@ fn adding_operation_changes_every_surface() {
         cli_output_flags: vec![],
         http_error_responses: vec![],
         raw_request: false,
+        raw_response: false,
+        raw_response_content_type: None,
     });
     let after = generate_all(&definition, &GenerateConfig::default());
     assert_ne!(before.cli_rs, after.cli_rs);
     assert_ne!(before.http_rs, after.http_rs);
     assert_ne!(before.mcp_json, after.mcp_json);
+    assert_ne!(before.ts_client_ts, after.ts_client_ts);
 }
 
 #[test]
@@ -207,6 +359,7 @@ fn surface_allowlist_hides_operations_per_surface() {
     assert!(!artifacts.cli_rs.contains("ListItems"), "CLI must be empty");
     assert!(artifacts.http_rs.contains("list_items"));
     assert!(artifacts.mcp_json.contains("list_items"));
+    assert!(!artifacts.ts_client_ts.contains("listItems"));
 }
 
 #[test]
@@ -226,11 +379,14 @@ fn sse_operations_are_excluded_from_mcp_and_unary_routes() {
         cli_output_flags: vec![],
         http_error_responses: vec![],
         raw_request: false,
+        raw_response: false,
+        raw_response_content_type: None,
     });
     let artifacts = generate_all(&definition, &GenerateConfig::default());
     assert!(!artifacts.mcp_json.contains("subscribe_events"));
     assert!(!artifacts.http_rs.contains("async fn subscribe_events("));
     assert!(artifacts.http_rs.contains("bind_subscribe_events"));
+    assert!(!artifacts.ts_client_ts.contains("subscribeEvents"));
     // CLI command override flows through
     assert!(artifacts.cli_rs.contains("Watch(WatchArgs)"));
 }
@@ -255,6 +411,7 @@ fn unary_cursor_pagination_projects_deterministically_across_surfaces() {
     assert_eq!(first.cli_rs, second.cli_rs);
     assert_eq!(first.http_rs, second.http_rs);
     assert_eq!(first.mcp_json, second.mcp_json);
+    assert_eq!(first.ts_client_ts, second.ts_client_ts);
 
     assert!(first.cli_rs.contains("GetContextPage(GetContextPageArgs)"));
     assert!(first.cli_rs.contains("pub limit: Option<u32>"));
@@ -293,6 +450,180 @@ fn unary_cursor_pagination_projects_deterministically_across_surfaces() {
     assert_eq!(
         mcp["locations"]["get_context_page"]["cursor"],
         serde_json::json!("query")
+    );
+    assert!(
+        first
+            .ts_client_ts
+            .contains("export interface GetContextPageParams")
+    );
+    assert!(first.ts_client_ts.contains("async getContextPage"));
+    assert!(
+        first
+            .ts_client_ts
+            .contains("url.searchParams.set(\"cursor\"")
+    );
+}
+
+#[test]
+fn typescript_client_projects_path_body_schema_and_auth_explicitly() {
+    let mut definition = definition_with_attachments();
+    definition.operations[0].method = HttpMethod::Post;
+    definition.operations[0].read = false;
+    definition.operations[0].path = "/items/{item_id}/parts/{part_id}".into();
+    definition.operations[0].parameters.push(Parameter {
+        name: "item_id".into(),
+        description: "Item ID.".into(),
+        ty: hydra_core::ParameterType::String,
+        required: true,
+        location: ParameterLocation::Path,
+        schema: None,
+        cli: None,
+    });
+    definition.operations[0].parameters.push(Parameter {
+        name: "part_id".into(),
+        description: "Part ID.".into(),
+        ty: hydra_core::ParameterType::String,
+        required: true,
+        location: ParameterLocation::Path,
+        schema: None,
+        cli: None,
+    });
+    let config = GenerateConfig {
+        ts_client_name: "NotesClient".into(),
+        ..GenerateConfig::default()
+    };
+    let artifacts = generate_all(&definition, &config);
+    assert!(artifacts.ts_client_ts.contains("export class NotesClient"));
+    assert!(
+        artifacts
+            .ts_client_ts
+            .contains("encodeURIComponent(String(params.item_id))")
+    );
+    assert!(
+        artifacts
+            .ts_client_ts
+            .contains("encodeURIComponent(String(params.part_id))")
+    );
+    assert!(artifacts.ts_client_ts.contains("attachments?: Array<{"));
+    assert!(artifacts.ts_client_ts.contains("mime_type: string"));
+    assert!(
+        artifacts
+            .ts_client_ts
+            .contains("headers.set(\"authorization\", `Bearer ${this.token}`)")
+    );
+    assert!(artifacts.ts_client_ts.contains("body: JSON.stringify({"));
+}
+
+#[test]
+fn typescript_surface_can_be_selected_without_other_surfaces() {
+    let mut definition = sample_definition();
+    definition.operations[0].surfaces = Some(vec![hydra_core::Surface::TsClient]);
+    let artifacts = generate_all(&definition, &GenerateConfig::default());
+    assert!(artifacts.ts_client_ts.contains("listItems"));
+    assert!(!artifacts.cli_rs.contains("ListItems"));
+    assert!(!artifacts.http_rs.contains("list_items"));
+    assert!(!artifacts.mcp_json.contains("list_items"));
+}
+
+#[test]
+fn typescript_output_option_uses_json_nullability() {
+    let mut definition = sample_definition();
+    definition.operations[0].output_type = "Option<Item>".into();
+    let artifacts = generate_all(&definition, &GenerateConfig::default());
+    assert!(
+        artifacts
+            .ts_client_ts
+            .contains("export type ListItemsResult = Item | null;")
+    );
+}
+
+#[test]
+fn typescript_json_schema_preserves_standard_null_union() {
+    let mut definition = definition_with_attachments();
+    definition.operations[0].parameters[1].schema = Some(serde_json::json!({
+        "type": ["string", "null"]
+    }));
+    let artifacts = generate_all(&definition, &GenerateConfig::default());
+    assert!(
+        artifacts
+            .ts_client_ts
+            .contains("attachments?: string | null;")
+    );
+}
+
+#[test]
+fn typescript_json_schema_preserves_nested_union_intersection_grouping() {
+    let definition = nested_ts_schema_fixture_definition();
+    hydra_core::validate::validate_definition(&definition)
+        .expect("nested TypeScript schema fixture must validate");
+    let artifacts = generate_all(&definition, &GenerateConfig::default());
+    let typescript = artifacts.ts_client_ts;
+
+    assert!(typescript.contains("direct: (\"a\" | \"b\") & \"b\""));
+    assert!(typescript.contains("enum_intersection: (\"red\" | \"blue\") & \"blue\""));
+    assert!(typescript.contains("array: Array<(\"left\" | \"right\") & \"right\">"));
+    assert!(
+        typescript
+            .contains("intersection: (\"nested-left\" | \"nested-right\") & \"nested-right\"")
+    );
+    assert!(typescript.contains("union: \"nested-a\" | \"nested-b\""));
+}
+
+#[test]
+fn typescript_generation_rejects_config_and_output_name_collisions() {
+    let invalid_config = GenerateConfig {
+        ts_client_name: "class".into(),
+        ..GenerateConfig::default()
+    };
+    assert!(invalid_config.validate().is_err());
+
+    let mut definition = sample_definition();
+    definition.operations[0].output_type = "ListItemsParams".into();
+    let error = hydra_core::validate::validate_definition(&definition)
+        .expect_err("output models must not shadow generated parameter types");
+    assert!(
+        error
+            .to_string()
+            .contains("collides with a generated TypeScript identifier")
+    );
+}
+
+#[test]
+fn rejects_sse_operations_on_typescript_surface_until_stream_contract_exists() {
+    let mut definition = sample_definition();
+    definition.operations[0].delivery = Delivery::Sse;
+    definition.operations[0].surfaces = Some(vec![
+        hydra_core::Surface::Http,
+        hydra_core::Surface::TsClient,
+    ]);
+    let error = hydra_core::validate::validate_definition(&definition)
+        .expect_err("SSE TypeScript projection must be explicitly unsupported");
+    assert!(error.to_string().contains("streaming TypeScript output"));
+}
+
+#[test]
+fn rejects_typescript_method_and_type_collisions_before_generation() {
+    let mut definition = sample_definition();
+    definition.operations[0].name = "list_items".into();
+    let mut colliding = definition.operations[0].clone();
+    colliding.name = "list__items".into();
+    definition.operations.push(colliding);
+    let error = hydra_core::validate::validate_definition(&definition)
+        .expect_err("double underscores must not collapse to one TypeScript method");
+    assert!(
+        error
+            .to_string()
+            .contains("colliding TypeScript client methods")
+    );
+
+    let mut reserved = sample_definition();
+    reserved.operations[0].name = "request".into();
+    let error = hydra_core::validate::validate_definition(&reserved)
+        .expect_err("client helper names must be reserved");
+    assert!(
+        error
+            .to_string()
+            .contains("reserved TypeScript client method")
     );
 }
 
@@ -363,6 +694,8 @@ fn raw_request_operation_generates_raw_handler() {
         cli_output_flags: vec![],
         http_error_responses: vec![],
         raw_request: true,
+        raw_response: false,
+        raw_response_content_type: None,
     });
     let artifacts = generate_all(&definition, &GenerateConfig::default());
     // Raw input struct emitted
@@ -422,6 +755,8 @@ fn raw_request_operation_with_path_parameter_extracts_typed_path() {
         cli_output_flags: vec![],
         http_error_responses: vec![],
         raw_request: true,
+        raw_response: false,
+        raw_response_content_type: None,
     });
     let artifacts = generate_all(&definition, &GenerateConfig::default());
     assert!(
@@ -448,6 +783,13 @@ fn raw_request_byte_identical_when_flag_absent() {
     let expected = include_str!("fixtures/notes-pre-raw-http.rs");
     let definition: ApiDefinition =
         serde_yaml::from_str(include_str!("fixtures/notes-pre-raw-operations.yaml")).unwrap();
+    assert!(
+        definition
+            .operations
+            .iter()
+            .all(|operation| !operation.raw_response
+                && operation.raw_response_content_type.is_none())
+    );
     // Config as of v0.1.0 (the fixture's provenance). The raw dispatch
     // knob is left at its default: it must not leak into output for
     // definitions that don't use raw operations.
@@ -461,6 +803,98 @@ fn raw_request_byte_identical_when_flag_absent() {
     assert!(!artifacts.http_rs.contains("GeneratedRawOperationInput"));
     assert!(!artifacts.http_rs.contains("HeaderMap"));
     assert_eq!(artifacts.http_rs, expected);
+}
+
+#[test]
+fn raw_response_requires_explicit_mime_and_rejects_unsupported_combinations() {
+    let base = raw_response_fixture_definition().operations.remove(0);
+    assert!(validate_raw_response_operation(base.clone()).is_ok());
+
+    let mut missing_mime = base.clone();
+    missing_mime.raw_response_content_type = None;
+    assert!(validate_raw_response_operation(missing_mime).is_err());
+
+    for invalid_mime in [
+        "",
+        "application/*",
+        "*/*",
+        "text/plain; charset=utf-8",
+        "text plain",
+        "text/\nplain",
+        "tëxt/plain",
+        "text/plain/extra",
+    ] {
+        let mut invalid = base.clone();
+        invalid.raw_response_content_type = Some(invalid_mime.to_owned());
+        assert!(
+            validate_raw_response_operation(invalid).is_err(),
+            "invalid MIME value should fail: {invalid_mime:?}"
+        );
+    }
+
+    let mut orphan_mime = base.clone();
+    orphan_mime.raw_response = false;
+    assert!(validate_raw_response_operation(orphan_mime).is_err());
+
+    for surfaces in [
+        None,
+        Some(vec![hydra_core::Surface::Http, hydra_core::Surface::Cli]),
+        Some(vec![hydra_core::Surface::Http, hydra_core::Surface::Mcp]),
+        Some(vec![
+            hydra_core::Surface::Http,
+            hydra_core::Surface::TsClient,
+        ]),
+        Some(vec![hydra_core::Surface::Http, hydra_core::Surface::Http]),
+    ] {
+        let mut unsupported = base.clone();
+        unsupported.surfaces = surfaces;
+        assert!(validate_raw_response_operation(unsupported).is_err());
+    }
+
+    let mut streaming = base.clone();
+    streaming.method = HttpMethod::Get;
+    streaming.read = true;
+    streaming.delivery = Delivery::Sse;
+    assert!(validate_raw_response_operation(streaming).is_err());
+
+    let mut raw_request = base.clone();
+    raw_request
+        .parameters
+        .retain(|p| p.location != ParameterLocation::Body);
+    raw_request.raw_request = true;
+    assert!(validate_raw_response_operation(raw_request).is_err());
+
+    let mut typed_errors = base.clone();
+    typed_errors
+        .http_error_responses
+        .push(hydra_core::HttpErrorResponse {
+            name: "not_found".to_owned(),
+            status: 404,
+            fields: vec![],
+        });
+    assert!(validate_raw_response_operation(typed_errors).is_err());
+
+    let mut cli_command = base.clone();
+    cli_command.cli_command = Some("fetch-bytes".to_owned());
+    assert!(validate_raw_response_operation(cli_command).is_err());
+
+    let mut cli_output_flag = base.clone();
+    cli_output_flag
+        .cli_output_flags
+        .push(hydra_core::CliOutputFlag {
+            flag: "verbose".to_owned(),
+            field: "verbose".to_owned(),
+            description: "Verbose output.".to_owned(),
+        });
+    assert!(validate_raw_response_operation(cli_output_flag).is_err());
+
+    let mut cli_parameter = base;
+    cli_parameter.parameters[0].cli = Some(hydra_core::CliOverride {
+        flag: None,
+        multiple: false,
+        companions: vec![],
+    });
+    assert!(validate_raw_response_operation(cli_parameter).is_err());
 }
 
 #[test]
@@ -514,6 +948,109 @@ fn committed_example_artifacts_are_current() {
     if let Some(e) = err {
         panic!("{e}");
     }
+}
+
+#[test]
+fn raw_response_fixture_is_fresh_and_all_four_artifacts_are_deterministic() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let fixture_root = format!("{root}/tests/fixtures/raw-http-response");
+    let definition_path = format!("{fixture_root}/api/operations.yaml");
+    let generated_dir = format!("{fixture_root}/generated");
+    let config = raw_response_fixture_config();
+    verify_generated(&definition_path, &generated_dir, &config)
+        .expect("committed finite raw-response fixture must be fresh");
+
+    let definition = raw_response_fixture_definition();
+    let first = generate_all(&definition, &config);
+    let second = generate_all(&definition, &config);
+    assert_eq!(first.cli_rs, second.cli_rs);
+    assert_eq!(first.http_rs, second.http_rs);
+    assert_eq!(first.mcp_json, second.mcp_json);
+    assert_eq!(first.ts_client_ts, second.ts_client_ts);
+
+    let temp = tempfile::tempdir().expect("temporary raw-response artifact directory");
+    let first_dir = temp.path().join("first");
+    let second_dir = temp.path().join("second");
+    write_generated(&first_dir, &first).expect("write first raw-response artifacts");
+    write_generated(&second_dir, &second).expect("write second raw-response artifacts");
+    for artifact in ["cli.rs", "http.rs", "mcp.json", "ts-client/index.ts"] {
+        let first_bytes = fs::read(first_dir.join(artifact)).expect("read first artifact");
+        let second_bytes = fs::read(second_dir.join(artifact)).expect("read second artifact");
+        assert_eq!(
+            first_bytes, second_bytes,
+            "two writes differ for {artifact}"
+        );
+    }
+    assert_eq!(
+        first.http_rs,
+        include_str!("fixtures/raw-http-response/generated/http.rs"),
+        "the compiled consumer fixture must match fresh generation"
+    );
+}
+
+#[test]
+fn committed_ts_client_fixture_is_fresh_and_rejects_stale_copy() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let definition_path = format!("{root}/../../examples/ts-client/api/operations.yaml");
+    let generated_dir = format!("{root}/../../examples/ts-client/generated");
+    let config: GenerateConfig =
+        serde_yaml::from_str(include_str!("../../../examples/ts-client/hydra.yaml"))
+            .expect("TypeScript fixture config parses");
+    config
+        .validate()
+        .expect("TypeScript fixture config validates");
+
+    verify_generated(&definition_path, &generated_dir, &config)
+        .expect("committed Iris TypeScript fixture must be fresh");
+
+    let definition = hydra_core::load_api_definition(&definition_path)
+        .expect("committed Iris TypeScript fixture definition parses");
+    let first = generate_all(&definition, &config);
+    let second = generate_all(&definition, &config);
+    assert_eq!(first.cli_rs, second.cli_rs);
+    assert_eq!(first.http_rs, second.http_rs);
+    assert_eq!(first.mcp_json, second.mcp_json);
+    assert_eq!(first.ts_client_ts, second.ts_client_ts);
+    assert!(
+        !first.ts_client_ts.trim().is_empty(),
+        "Iris fixture must emit a non-empty TypeScript projection"
+    );
+
+    let temp = tempfile::tempdir().expect("temporary generated-artifact directory");
+    let first_dir = temp.path().join("first");
+    let second_dir = temp.path().join("second");
+    write_generated(&first_dir, &first).expect("write first TypeScript fixture copy");
+    write_generated(&second_dir, &second).expect("write second TypeScript fixture copy");
+    for artifact in ["cli.rs", "http.rs", "mcp.json", "ts-client/index.ts"] {
+        assert_eq!(
+            fs::read(first_dir.join(artifact)).expect("read first fixture artifact"),
+            fs::read(second_dir.join(artifact)).expect("read second fixture artifact"),
+            "two generated writes must be byte-identical for {artifact}"
+        );
+    }
+    verify_generated(&definition_path, &first_dir, &config)
+        .expect("fresh temporary Iris fixture copy must verify");
+
+    let ts_path = first_dir.join("ts-client/index.ts");
+    let ts = fs::read_to_string(&ts_path).expect("read copied TypeScript fixture");
+    let stale_ts = ts.replacen(
+        "this.name = \"ApiError\";",
+        "this.name = \"ApiErrorV2\";",
+        1,
+    );
+    assert_ne!(
+        stale_ts, ts,
+        "fixture must contain a type-correct value to mutate"
+    );
+    fs::write(&ts_path, stale_ts).expect("edit only copied TypeScript fixture");
+    assert!(
+        verify_generated(&definition_path, &first_dir, &config).is_err(),
+        "freshness check must reject a stale TypeScript artifact even when its edit is type-correct"
+    );
+
+    write_generated(&first_dir, &first).expect("restore copied TypeScript fixture");
+    verify_generated(&definition_path, &first_dir, &config)
+        .expect("restored temporary Iris fixture copy must verify");
 }
 
 // ── json parameters + CLI representation overrides (COD-411) ───────────────
@@ -1025,6 +1562,11 @@ fn output_flag_fixture_is_fresh_and_deterministic() {
     assert_eq!(first.cli_rs, second.cli_rs);
     assert_eq!(first.http_rs, second.http_rs);
     assert_eq!(first.mcp_json, second.mcp_json);
+    assert_eq!(first.ts_client_ts, second.ts_client_ts);
+    assert!(
+        !first.ts_client_ts.is_empty(),
+        "fixture must emit a TypeScript projection"
+    );
 
     let temp = tempfile::tempdir().expect("temporary generated-artifact directory");
     let first_dir = temp.path().join("first");
@@ -1032,7 +1574,7 @@ fn output_flag_fixture_is_fresh_and_deterministic() {
     write_generated(&first_dir, &first).expect("write first generated artifact set");
     write_generated(&second_dir, &second).expect("write second generated artifact set");
 
-    for artifact in ["cli.rs", "http.rs", "mcp.json"] {
+    for artifact in ["cli.rs", "http.rs", "mcp.json", "ts-client/index.ts"] {
         assert_eq!(
             fs::read(first_dir.join(artifact)).expect("read first generated artifact"),
             fs::read(second_dir.join(artifact)).expect("read second generated artifact"),
@@ -1371,13 +1913,14 @@ fn http_error_response_fixture_is_fresh_and_byte_deterministic() {
     assert_eq!(first.cli_rs, second.cli_rs);
     assert_eq!(first.http_rs, second.http_rs);
     assert_eq!(first.mcp_json, second.mcp_json);
+    assert_eq!(first.ts_client_ts, second.ts_client_ts);
 
     let temp = tempfile::tempdir().expect("temporary generated-artifact directory");
     let first_dir = temp.path().join("first");
     let second_dir = temp.path().join("second");
     write_generated(&first_dir, &first).expect("write first generated artifact set");
     write_generated(&second_dir, &second).expect("write second generated artifact set");
-    for artifact in ["cli.rs", "http.rs", "mcp.json"] {
+    for artifact in ["cli.rs", "http.rs", "mcp.json", "ts-client/index.ts"] {
         assert_eq!(
             fs::read(first_dir.join(artifact)).expect("read first generated artifact"),
             fs::read(second_dir.join(artifact)).expect("read second generated artifact"),
@@ -1405,6 +1948,181 @@ fn http_error_response_fixture_is_fresh_and_byte_deterministic() {
         generate_all(&no_error_definition, &no_error_config).http_rs,
         include_str!("fixtures/notes-pre-raw-http.rs")
     );
+}
+
+fn write_http_error_response_loader_fixture(
+    temp: &tempfile::TempDir,
+    name: &str,
+    yaml: &str,
+) -> PathBuf {
+    let path = temp.path().join(format!("{name}.yaml"));
+    fs::write(&path, yaml).expect("write temporary HTTP-error loader fixture");
+    path
+}
+
+fn http_error_response_fixture_with_required_constant(constant: &str) -> String {
+    include_str!("fixtures/http-error-responses/operations.yaml").replacen(
+        "            const: \"rate \\u0001 \\\"limited\\\"\"",
+        &format!("            const: {constant}"),
+        1,
+    )
+}
+
+fn http_error_response_fixture_with_optional_constant(constant: &str) -> String {
+    const OPTIONAL_RETRY_HINT: &str =
+        "          - name: retry_hint\n            type: string\n            required: false\n";
+
+    include_str!("fixtures/http-error-responses/operations.yaml").replacen(
+        OPTIONAL_RETRY_HINT,
+        &format!("{OPTIONAL_RETRY_HINT}            const: {constant}\n"),
+        1,
+    )
+}
+
+/// The required and optional field scopes must both reject a supplied empty
+/// string constant at the loader boundary, with the declaration identified.
+fn assert_quoted_empty_string_const_rejected(temp: &tempfile::TempDir) {
+    for (scope, field_name) in [("required", "error"), ("optional", "retry_hint")] {
+        let yaml = match scope {
+            "required" => http_error_response_fixture_with_required_constant("\"\""),
+            "optional" => http_error_response_fixture_with_optional_constant("\"\""),
+            _ => unreachable!("test scope is fixed"),
+        };
+        let fixture =
+            write_http_error_response_loader_fixture(temp, &format!("{scope}-quoted-empty"), &yaml);
+        let error = hydra_core::load_api_definition(&fixture).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(&fixture.display().to_string()),
+            "{scope} empty-string error must identify the definition source: {rendered}"
+        );
+        assert!(
+            rendered.contains("declares const as an empty string"),
+            "{scope} empty-string error must identify const: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "operation read_events HTTP error response rate_limited field {field_name}"
+            )),
+            "{scope} empty-string error must identify the operation, response, and field: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn http_error_constant_loader_distinguishes_omission_from_explicit_non_strings() {
+    let temp = tempfile::tempdir().expect("temporary loader fixture directory");
+
+    // The committed fixture exercises escaped required strings, plus omitted
+    // required and optional constants through the real YAML loader.
+    let committed_fixture = write_http_error_response_loader_fixture(
+        &temp,
+        "committed",
+        include_str!("fixtures/http-error-responses/operations.yaml"),
+    );
+    let definition = hydra_core::load_api_definition(&committed_fixture)
+        .expect("committed HTTP-error fixture loads through the real boundary");
+    let fields = &definition.operations[0].http_error_responses[0].fields;
+    assert_eq!(
+        fields[0].constant.as_deref(),
+        Some("rate \u{0001} \"limited\"")
+    );
+    assert!(
+        fields[1].constant.is_none(),
+        "omitted required const is dynamic"
+    );
+    assert!(
+        fields[2].constant.is_none(),
+        "omitted optional const is dynamic"
+    );
+    assert!(generate_all(&definition, &http_error_responses_config()).http_rs.contains(
+        "pub fn rate_limited(retry_after: String, retry_hint: Option<String>) -> RateLimitedResponse"
+    ));
+
+    // Quoted scalar text is valid declaration data, so long as it carries
+    // content; it remains fixed rather than becoming a generated constructor
+    // argument.
+    for (name, declaration, expected) in [
+        ("quoted-numeric", "\"42\"", "42"),
+        ("quoted-boolean", "\"true\"", "true"),
+    ] {
+        let fixture = write_http_error_response_loader_fixture(
+            &temp,
+            name,
+            &http_error_response_fixture_with_required_constant(declaration),
+        );
+        let definition = hydra_core::load_api_definition(&fixture)
+            .unwrap_or_else(|error| panic!("{name} string constant must load: {error:#}"));
+        assert_eq!(
+            definition.operations[0].http_error_responses[0].fields[0]
+                .constant
+                .as_deref(),
+            Some(expected)
+        );
+        assert!(generate_all(&definition, &http_error_responses_config()).http_rs.contains(
+            "pub fn rate_limited(retry_after: String, retry_hint: Option<String>) -> RateLimitedResponse"
+        ));
+    }
+
+    // A supplied empty string declares no fixed value; it must stop at
+    // load_api_definition before generation, for both required and optional
+    // fields.
+    assert_quoted_empty_string_const_rejected(&temp);
+
+    // Every supplied non-string form must stop at load_api_definition before
+    // generation, for both required and optional fields.
+    for (scope, field_name) in [("required", "error"), ("optional", "retry_hint")] {
+        for (name, declaration) in [
+            ("null", "null"),
+            ("tilde", "~"),
+            ("empty-value", ""),
+            ("boolean", "true"),
+            ("integer", "42"),
+            ("float", "4.2"),
+            ("sequence", "[unexpected]"),
+            ("mapping", "{unexpected: value}"),
+        ] {
+            let yaml = match scope {
+                "required" => http_error_response_fixture_with_required_constant(declaration),
+                "optional" => http_error_response_fixture_with_optional_constant(declaration),
+                _ => unreachable!("test scope is fixed"),
+            };
+            let fixture =
+                write_http_error_response_loader_fixture(&temp, &format!("{scope}-{name}"), &yaml);
+            let error = hydra_core::load_api_definition(&fixture).unwrap_err();
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains(&fixture.display().to_string()),
+                "{scope}/{name} error must identify the definition source: {rendered}"
+            );
+            assert!(
+                rendered.contains("const must be a string when supplied"),
+                "{scope}/{name} error must identify const: {rendered}"
+            );
+            assert!(
+                rendered.contains(&format!(
+                    "operation read_events HTTP error response rate_limited field {field_name}"
+                )),
+                "{scope}/{name} error must identify the operation, response, and field: {rendered}"
+            );
+        }
+    }
+
+    let optional_string = write_http_error_response_loader_fixture(
+        &temp,
+        "optional-string",
+        &http_error_response_fixture_with_optional_constant("fixed"),
+    );
+    let error = hydra_core::load_api_definition(&optional_string)
+        .expect_err("optional string constants remain invalid by contract");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains(&optional_string.display().to_string()),
+        "optional string error must identify the definition source: {rendered}"
+    );
+    assert!(rendered.contains(
+        "operation read_events HTTP error response rate_limited field retry_hint declares const but is optional"
+    ));
 }
 
 #[test]
@@ -1525,5 +2243,135 @@ operations:
     assert!(
         serde_yaml::from_str::<ApiDefinition>(unsupported_type).is_err(),
         "v1 error fields support only declared string values"
+    );
+}
+
+fn lockfile_package_version(lock_text: &str, package: &str) -> String {
+    let needle = format!("name = \"{package}\"");
+    let mut lines = lock_text.lines().map(str::trim);
+    while let Some(line) = lines.next() {
+        if line != needle {
+            continue;
+        }
+        for candidate in lines.by_ref() {
+            if candidate == "[[package]]" {
+                break;
+            }
+            if let Some(version) = candidate.strip_prefix("version = ") {
+                return version.replace('"', "");
+            }
+        }
+    }
+    panic!("workspace lockfile has no {package} entry");
+}
+
+/// Materialize a scratch consumer crate that includes the committed generated
+/// raw-response module and binds a dispatcher with the requested return type.
+fn raw_response_consumer_scratch(
+    name: &str,
+    dispatch_return_type: &str,
+    dispatch_body: &str,
+) -> PathBuf {
+    let scratch_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("raw-response-compile-tests");
+    fs::create_dir_all(&scratch_root).expect("create raw-response compile-test root");
+    let crate_dir = scratch_root.join(name);
+    let src_dir = crate_dir.join("src");
+    fs::create_dir_all(&src_dir).expect("create scratch consumer src dir");
+    fs::write(
+        src_dir.join("http.rs"),
+        include_str!("fixtures/raw-http-response/generated/http.rs"),
+    )
+    .expect("copy committed generated fixture into scratch consumer");
+
+    let lock_text = include_str!("../../../Cargo.lock");
+    let manifest = format!(
+        "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n\
+         [dependencies]\naxum = \"{}\"\nserde_json = \"{}\"\n\n[workspace]\n",
+        lockfile_package_version(lock_text, "axum"),
+        lockfile_package_version(lock_text, "serde_json"),
+    );
+    fs::write(crate_dir.join("Cargo.toml"), manifest).expect("write scratch consumer manifest");
+
+    let lib_rs = format!(
+        "#[derive(Clone, Default)]\npub struct RawResponseFixtureState;\n\n\
+         pub mod generated_http {{\n    include!(\"http.rs\");\n}}\n\n\
+         #[allow(clippy::unused_async)]\n\
+         pub async fn raw_response_dispatch(\n    \
+         _state: &RawResponseFixtureState,\n    \
+         _operation: &str,\n    \
+         _input: generated_http::GeneratedOperationInput,\n) -> {dispatch_return_type} {{\n    \
+         {dispatch_body}\n}}\n\n\
+         pub fn build_router() -> axum::Router {{\n    \
+         generated_http::generated_router().with_state(RawResponseFixtureState)\n}}\n"
+    );
+    fs::write(src_dir.join("lib.rs"), lib_rs).expect("write scratch consumer lib.rs");
+    crate_dir
+}
+
+fn check_raw_response_consumer(
+    name: &str,
+    dispatch_return_type: &str,
+    dispatch_body: &str,
+) -> (bool, String) {
+    let crate_dir = raw_response_consumer_scratch(name, dispatch_return_type, dispatch_body);
+    let shared_target = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("raw-response-compile-tests")
+        .join("target");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let output = std::process::Command::new(cargo)
+        .args(["check", "--offline"])
+        .arg("--manifest-path")
+        .arg(crate_dir.join("Cargo.toml"))
+        .env("CARGO_TARGET_DIR", shared_target)
+        .output()
+        .expect("spawn nested cargo check for raw-response consumer");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    (output.status.success(), log)
+}
+
+#[test]
+fn raw_response_generated_binding_is_annotated_as_finite_bytes() {
+    let artifacts = generate_all(
+        &raw_response_fixture_definition(),
+        &raw_response_fixture_config(),
+    );
+    assert!(
+        artifacts.http_rs.contains("let response_body: Vec<u8> = "),
+        "generated raw-response handler must type-annotate its dispatch binding as Vec<u8>"
+    );
+}
+
+#[test]
+fn compiled_raw_response_consumer_rejects_body_dispatch_and_accepts_finite_bytes() {
+    let (control_ok, control_log) =
+        check_raw_response_consumer("raw-response-control", "Vec<u8>", "Vec::new()");
+    assert!(
+        control_ok,
+        "finite Vec<u8> raw-response consumer must compile:\n{control_log}"
+    );
+
+    let (violation_ok, violation_log) = check_raw_response_consumer(
+        "raw-response-body-dispatch-rejected",
+        "axum::body::Body",
+        "unreachable!(\"streaming dispatchers must be rejected at compile time\")",
+    );
+    assert!(
+        !violation_ok,
+        "a Body-returning raw-response dispatcher must fail to compile:\n{violation_log}"
+    );
+    assert!(
+        violation_log.contains("E0308"),
+        "rejection must be a type mismatch at the generated binding:\n{violation_log}"
     );
 }

@@ -6,10 +6,7 @@
 //! parameters, names must be collision-free, and surface allowlists must be
 //! self-consistent.
 
-use std::path::Path;
-
 use anyhow::Result;
-use serde_yaml::Value;
 
 use crate::{
     ApiDefinition, GENERATED_HTTP_RESERVED_NAMES, HttpErrorFieldType, HttpMethod, Operation,
@@ -56,11 +53,14 @@ pub fn validate_definition(definition: &ApiDefinition) -> Result<()> {
         validate_operation_parameters(operation)?;
         validate_operation_surfaces(operation)?;
         validate_operation_raw_request(operation)?;
+        validate_operation_raw_response(operation)?;
         validate_operation_cli_overrides(operation)?;
         validate_operation_http_error_responses(operation)?;
+        validate_operation_ts_client(operation)?;
     }
 
     validate_http_error_module_names(definition)?;
+    validate_ts_client_names(definition)?;
 
     // CLI command overrides must not collide with any generated subcommand.
     let mut cli_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -334,93 +334,6 @@ fn validate_operation_http_error_responses(operation: &Operation) -> Result<()> 
     Ok(())
 }
 
-/// Validate HTTP-error `const` declarations against the raw YAML form.
-///
-/// Typed parsing collapses YAML distinctions that carry contract meaning: an
-/// omitted `const` key and an unquoted empty `const:` both deserialize to
-/// `Option::None`, and unquoted booleans and numbers coerce into strings
-/// (`const: true` becomes `"true"`). This walk runs at load time on the
-/// parsed-but-untyped value, before typed parsing, so every rejected
-/// declaration names the definition file path and the offending field's
-/// `const` key. Omitted keys, string scalars (including quoted empty and
-/// quoted boolean/number-looking scalars), and constants on `required: true`
-/// fields pass through unchanged.
-pub fn validate_http_error_constant_declarations(
-    raw: &Value,
-    definition_path: &Path,
-) -> Result<()> {
-    let Some(operations) = raw.get("operations").and_then(Value::as_sequence) else {
-        return Ok(());
-    };
-    for operation in operations {
-        let operation_name = scalar_name(operation, "name");
-        let Some(responses) = operation
-            .get("http_error_responses")
-            .and_then(Value::as_sequence)
-        else {
-            continue;
-        };
-        for response in responses {
-            let response_name = scalar_name(response, "name");
-            let Some(fields) = response.get("fields").and_then(Value::as_sequence) else {
-                continue;
-            };
-            for field in fields {
-                let Some(const_value) = field.get("const") else {
-                    continue;
-                };
-                let field_name = scalar_name(field, "name");
-                anyhow::ensure!(
-                    const_value.is_string(),
-                    "{}: operation {} HTTP error response {} field {} declares const with {}; const must be a string scalar; quote the value (const: \"...\") or omit the key to keep the field dynamic",
-                    definition_path.display(),
-                    operation_name,
-                    response_name,
-                    field_name,
-                    describe_const_value(const_value)
-                );
-                anyhow::ensure!(
-                    field
-                        .get("required")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    "{}: operation {} HTTP error response {} field {} declares const but is optional; constants require required: true",
-                    definition_path.display(),
-                    operation_name,
-                    response_name,
-                    field_name
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Describe the YAML type of an offending `const` value for error messages.
-fn describe_const_value(value: &Value) -> String {
-    match value {
-        Value::Null => "an empty unquoted value (null)".to_owned(),
-        Value::Bool(value) => format!("a boolean value ({value})"),
-        Value::Number(value) => format!("a number value ({value})"),
-        Value::Sequence(_) => "a sequence value".to_owned(),
-        Value::Mapping(_) => "a mapping value".to_owned(),
-        Value::Tagged(_) => "a tagged value".to_owned(),
-        Value::String(value) => format!("a string value (\"{value}\")"),
-    }
-}
-
-/// Read a `name`-style scalar out of a raw YAML mapping for error messages.
-///
-/// Malformed names leave the typed parse to report its own structured error;
-/// this only keeps rejection messages pointing at something identifiable.
-fn scalar_name<'a>(value: &'a Value, key: &str) -> &'a str {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or("<unknown>")
-}
-
 /// Reject collisions between generated HTTP-error module names and existing
 /// generated HTTP items before Rust reports an opaque duplicate-item error.
 fn validate_http_error_module_names(definition: &ApiDefinition) -> Result<()> {
@@ -596,6 +509,84 @@ fn validate_operation_raw_request(operation: &Operation) -> Result<()> {
     Ok(())
 }
 
+/// Validate the finite raw-response contract without changing the existing
+/// raw-request input boundary.
+fn validate_operation_raw_response(operation: &Operation) -> Result<()> {
+    if !operation.is_raw_response() {
+        anyhow::ensure!(
+            operation.raw_response_content_type.is_none(),
+            "operation {} declares raw_response_content_type without raw_response: true",
+            operation.name
+        );
+        return Ok(());
+    }
+
+    anyhow::ensure!(
+        operation
+            .surfaces
+            .as_ref()
+            .is_some_and(|surfaces| surfaces.len() == 1 && surfaces.contains(&Surface::Http)),
+        "operation {} uses raw_response but does not list exactly the http surface; \
+         raw responses are http-only",
+        operation.name
+    );
+    anyhow::ensure!(
+        !operation.is_sse(),
+        "operation {} uses raw_response with delivery: sse; raw responses are unary-only",
+        operation.name
+    );
+    anyhow::ensure!(
+        !operation.is_raw_request(),
+        "operation {} uses both raw_request and raw_response; this combination is unsupported",
+        operation.name
+    );
+    anyhow::ensure!(
+        operation.http_error_responses.is_empty(),
+        "operation {} uses raw_response with http_error_responses; typed HTTP errors are unsupported",
+        operation.name
+    );
+    anyhow::ensure!(
+        operation.cli_command.is_none()
+            && operation.cli_output_flags.is_empty()
+            && operation
+                .parameters
+                .iter()
+                .all(|parameter| parameter.cli.is_none()),
+        "operation {} uses raw_response with CLI-specific options; CLI options are unsupported",
+        operation.name
+    );
+
+    let Some(content_type) = operation.raw_response_content_type.as_deref() else {
+        anyhow::bail!(
+            "operation {} uses raw_response but declares no raw_response_content_type",
+            operation.name
+        );
+    };
+    anyhow::ensure!(
+        is_valid_raw_response_content_type(content_type),
+        "operation {} declares invalid raw_response_content_type {content_type:?}; \
+         expected an explicit ASCII MIME type/subtype token without parameters or wildcards",
+        operation.name
+    );
+    Ok(())
+}
+
+/// Accept one literal MIME type/subtype using HTTP token characters only.
+/// Wildcards are deliberately excluded even though `*` is an HTTP token.
+fn is_valid_raw_response_content_type(value: &str) -> bool {
+    let Some((media_type, subtype)) = value.split_once('/') else {
+        return false;
+    };
+    if media_type.is_empty() || subtype.is_empty() || subtype.contains('/') || !value.is_ascii() {
+        return false;
+    }
+    let is_token = |part: &str| {
+        part.bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'+-.^_`|~".contains(&byte))
+    };
+    is_token(media_type) && is_token(subtype)
+}
+
 /// Validate surface allowlists, delivery-kind rules, and CLI command names.
 fn validate_operation_surfaces(operation: &Operation) -> Result<()> {
     if let Some(surfaces) = &operation.surfaces {
@@ -643,8 +634,146 @@ fn validate_operation_surfaces(operation: &Operation) -> Result<()> {
             operation.name
         );
     }
-    let _ = Surface::Http; // surface enum is part of the public contract
     Ok(())
+}
+
+/// Validate the TypeScript projection's deliberately narrow v1 boundary.
+///
+/// The generated client is a unary JSON/fetch client. SSE operations retain
+/// their explicit HTTP/CLI projection and must wait for a separately defined
+/// streaming TypeScript contract; an explicit `ts_client` allowlist is rejected
+/// rather than silently projecting a stream as JSON.
+fn validate_operation_ts_client(operation: &Operation) -> Result<()> {
+    anyhow::ensure!(
+        !(operation.generates_ts_client() && operation.is_sse()),
+        "operation {} uses delivery: sse but generates the TypeScript client surface; streaming TypeScript output is not defined yet",
+        operation.name
+    );
+    Ok(())
+}
+
+/// Reject collisions in the TypeScript identifiers emitted for operations.
+///
+/// Snake-case identifiers such as `foo_bar` and `foo__bar` are distinct in the
+/// source model but collapse to the same TypeScript method/type spelling.
+/// Reserve the client's private helper names too, so a generated operation
+/// cannot make the emitted class uncompilable.
+fn validate_ts_client_names(definition: &ApiDefinition) -> Result<()> {
+    let mut methods = std::collections::BTreeSet::new();
+    let mut types = std::collections::BTreeSet::from([
+        "ClientOptions".to_owned(),
+        "ApiError".to_owned(),
+        "JsonValue".to_owned(),
+    ]);
+    for operation in definition
+        .operations
+        .iter()
+        .filter(|operation| operation.generates_ts_client() && !operation.is_sse())
+    {
+        let method = typescript_camel_case(&operation.name);
+        anyhow::ensure!(
+            !matches!(
+                method.as_str(),
+                "constructor" | "baseUrl" | "token" | "fetchImpl" | "makeUrl" | "request"
+            ),
+            "operation {} generates reserved TypeScript client method {}",
+            operation.name,
+            method
+        );
+        anyhow::ensure!(
+            methods.insert(method.clone()),
+            "operations generate colliding TypeScript client methods: {method}"
+        );
+
+        let prefix = typescript_pascal_case(&operation.name);
+        for suffix in ["Params", "Result"] {
+            let name = format!("{prefix}{suffix}");
+            anyhow::ensure!(
+                types.insert(name.clone()),
+                "operations generate colliding TypeScript client types: {name}"
+            );
+        }
+    }
+
+    let mut output_types = std::collections::BTreeSet::new();
+    for operation in definition
+        .operations
+        .iter()
+        .filter(|operation| operation.generates_ts_client() && !operation.is_sse())
+    {
+        collect_typescript_output_names(operation.output_type.trim(), &mut output_types);
+    }
+    for name in output_types {
+        anyhow::ensure!(
+            types.insert(name.clone()),
+            "output type {name} collides with a generated TypeScript identifier"
+        );
+    }
+    Ok(())
+}
+
+fn typescript_pascal_case(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut upper_next = true;
+    for character in value.chars() {
+        if character == '_' {
+            upper_next = true;
+        } else if upper_next {
+            out.extend(character.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(character);
+        }
+    }
+    out
+}
+
+fn typescript_camel_case(value: &str) -> String {
+    let pascal = typescript_pascal_case(value);
+    let mut characters = pascal.chars();
+    characters.next().map_or_else(String::new, |first| {
+        first.to_lowercase().collect::<String>() + characters.as_str()
+    })
+}
+
+fn collect_typescript_output_names(
+    output_type: &str,
+    names: &mut std::collections::BTreeSet<String>,
+) {
+    for wrapper in ["Vec", "Option", "Result"] {
+        if let Some(inner) = output_type
+            .strip_prefix(&format!("{wrapper}<"))
+            .and_then(|rest| rest.strip_suffix('>'))
+        {
+            if wrapper == "Result" {
+                for argument in inner.split(',') {
+                    collect_typescript_output_names(argument.trim(), names);
+                }
+            } else {
+                collect_typescript_output_names(inner.trim(), names);
+            }
+            return;
+        }
+    }
+    if is_typescript_output_identifier(output_type)
+        && !matches!(
+            output_type,
+            "String" | "str" | "string" | "bool" | "boolean" | "Value" | "Json" | "json" | "number"
+        )
+    {
+        names.insert(output_type.to_owned());
+    }
+}
+
+fn is_typescript_output_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        && value
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_uppercase())
 }
 
 /// Whether a value is lowercase kebab-case (letters, digits, single hyphens).

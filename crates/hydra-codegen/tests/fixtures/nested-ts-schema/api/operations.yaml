@@ -1,0 +1,52 @@
+operations:
+  - name: validate_payload
+    description: Validate nested JSON Schema unions and intersections.
+    method: POST
+    path: /validate
+    read: false
+    output_type: json
+    surfaces: [ts_client]
+    parameters:
+      - name: payload
+        description: Payload containing nested precedence-sensitive schemas.
+        type: json
+        required: true
+        location: body
+        schema:
+          type: object
+          properties:
+            direct:
+              allOf:
+                - anyOf:
+                    - const: a
+                    - const: b
+                - const: b
+            enum_intersection:
+              allOf:
+                - enum: [red, blue]
+                - const: blue
+            array:
+              type: array
+              items:
+                allOf:
+                  - oneOf:
+                      - const: left
+                      - const: right
+                  - enum: [right]
+            object:
+              type: object
+              properties:
+                union:
+                  anyOf:
+                    - const: nested-a
+                    - const: nested-b
+                intersection:
+                  allOf:
+                    - anyOf:
+                        - const: nested-left
+                        - const: nested-right
+                    - const: nested-right
+              required: [union, intersection]
+              additionalProperties: false
+          required: [direct, enum_intersection, array, object]
+          additionalProperties: false
